@@ -329,16 +329,17 @@ fn register_with_unknown_fee_payer_fails_before_any_network_access() {
 }
 
 #[test]
-fn register_with_trader_as_fee_payer_is_rejected_before_any_network_access() {
+fn register_with_trader_as_fee_payer_is_a_transparent_noop() {
     let tmp = tempfile::tempdir().unwrap();
     create_default_local_wallet(tmp.path());
 
-    // "mcp-test" is the default (trader) wallet; sponsoring yourself is a no-op.
+    // "mcp-test" is the default (trader) wallet. Naming it as sponsor is not an
+    // error: the trader just pays for itself, so the flow proceeds to the RPC.
     let v = register_offline(tmp.path(), &["--fee-payer", "mcp-test"]);
 
     assert_eq!(v["ok"], false, "envelope: {v}");
-    assert_eq!(v["error"]["code"], "FEE_PAYER_IS_TRADER", "envelope: {v}");
-    assert_eq!(v["error"]["category"], "validation", "envelope: {v}");
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+    assert_eq!(v["error"]["category"], "network", "envelope: {v}");
 }
 
 #[test]
@@ -433,8 +434,11 @@ fn linked_paymaster_is_used_by_register_and_can_be_cleared() {
     assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
 
     // A global --fee-payer placed before the subcommand overrides the link.
-    let v = register_offline_with_global(tmp.path(), &["--fee-payer", "mcp-test"]);
-    assert_eq!(v["error"]["code"], "FEE_PAYER_IS_TRADER", "envelope: {v}");
+    let v = register_offline_with_global(tmp.path(), &["--fee-payer", "no-such-wallet"]);
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
 
     let cleared = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
     assert_eq!(cleared["ok"], true, "envelope: {cleared}");

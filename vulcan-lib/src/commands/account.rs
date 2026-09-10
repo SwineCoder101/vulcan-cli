@@ -1,7 +1,7 @@
 //! Account command execution.
 
 use crate::cli::account::AccountCommand;
-use crate::commands::fee_payer::{resolve_fee_payer, FeePayerWallet};
+use crate::commands::fee_payer::{format_sol_lamports, resolve_fee_payer, FeePayerWallet};
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
@@ -26,7 +26,6 @@ const CROSS_MARGIN_MAX_POSITIONS: u32 = 128;
 /// Used when the user registers without providing a referral code; the
 /// activate-tx endpoint requires one.
 const DEFAULT_REFERRAL_CODE: &str = "VULCAN";
-const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 const TRADER_HEADER_LEN: usize = 224;
 const TRADER_POSITION_MAP_PREFIX_LEN: usize = 16;
 const TRADER_POSITION_ENTRY_LEN: usize = 40;
@@ -73,19 +72,6 @@ fn trader_account_size(max_positions: u32) -> Result<usize, VulcanError> {
                 "Trader account size overflowed",
             )
         })
-}
-
-fn format_sol_lamports(lamports: u64) -> String {
-    let whole = lamports / LAMPORTS_PER_SOL;
-    let fractional = lamports % LAMPORTS_PER_SOL;
-    let mut value = format!("{whole}.{fractional:09}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    if value.ends_with('.') {
-        value.push('0');
-    }
-    value
 }
 
 async fn ensure_sol_for_cross_trader_rent(

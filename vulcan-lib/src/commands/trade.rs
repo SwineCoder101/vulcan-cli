@@ -513,10 +513,6 @@ pub async fn send_or_dry_run_with_cu_limit(
     }
 
     let signer = wallet.signer()?;
-    let sponsor_signer = match &sponsor {
-        Some(sponsor) => Some(sponsor.signer().await?),
-        None => None,
-    };
 
     let rpc_client = ctx.rpc_client();
 
@@ -547,6 +543,16 @@ pub async fn send_or_dry_run_with_cu_limit(
 
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&all_ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
+
+    // A paymaster is a shared, easy-to-forget balance: check it can cover the
+    // fee before unlocking it, so the user sees amounts instead of an RPC error.
+    if sponsor.is_some() {
+        crate::commands::fee_payer::ensure_sol_for_fee(&rpc_client, fee_payer, &tx.message)?;
+    }
+    let sponsor_signer = match &sponsor {
+        Some(sponsor) => Some(sponsor.signer().await?),
+        None => None,
+    };
 
     let sponsor_dyn: Option<&dyn solana_keychain::SolanaSigner> = match &sponsor_signer {
         Some(s) => Some(s.signer()?),
