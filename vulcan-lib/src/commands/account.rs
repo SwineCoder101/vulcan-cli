@@ -4,7 +4,7 @@ use crate::cli::account::AccountCommand;
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
-use crate::wallet::ResolvedSigner;
+use crate::wallet::{ResolvedSigner, WalletFile};
 use phoenix_rise::accounts::owned::Permission;
 use phoenix_rise::accounts::permission::TRADER_ONBOARDING_PERMISSION;
 use phoenix_rise::api::{
@@ -38,6 +38,9 @@ pub struct RegisterResult {
     pub trader_pda: String,
     pub dry_run: bool,
     pub tx_signature: Option<String>,
+    /// Sponsor wallet pubkey when `--fee-payer` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<String>,
 }
 
 pub(crate) async fn trader_onboarding_status(
@@ -172,6 +175,9 @@ impl TableRenderable for RegisterResult {
         }
         println!("  Authority: {}", self.authority);
         println!("  Trader PDA: {}", self.trader_pda);
+        if let Some(fee_payer) = &self.fee_payer {
+            println!("  Fee payer: {}", fee_payer);
+        }
         if let Some(sig) = &self.tx_signature {
             println!("  Tx: {}", sig);
         }
@@ -410,6 +416,7 @@ pub async fn execute(ctx: &AppContext, cmd: AccountCommand) -> Result<(), Vulcan
                 trader_pda: trader_key.pda().to_string(),
                 dry_run: ctx.dry_run,
                 tx_signature: sig,
+                fee_payer: None,
             };
 
             render_success(ctx.output_format, &result, serde_json::Value::Null);
@@ -542,39 +549,54 @@ async fn sign_onboarding_transaction_for_api(
     Ok((transaction, recent_blockhash.to_string(), fee_payer))
 }
 
-/// Resolve a stored wallet as the sponsored fee payer for registration.
-async fn resolve_fee_payer_signer(
-    ctx: &AppContext,
-    name: &str,
-    trader_authority: Pubkey,
-) -> Result<ResolvedSigner, VulcanError> {
-    let name = name.trim();
-    if name.is_empty() || !ctx.wallet_store.exists(name) {
-        return Err(VulcanError::auth(
-            "FEE_PAYER_WALLET_NOT_FOUND",
-            format!(
-                "Fee payer wallet '{name}' not found. Use `vulcan wallet list` for stored names."
-            ),
-        ));
+/// A stored sponsor wallet validated for `--fee-payer`, before any network access.
+///
+/// Loading is offline (wallet-store lookup and pubkey checks) so a bad flag fails
+/// fast and dry runs can report the sponsor. The signer is only unlocked when a
+/// transaction is actually submitted.
+struct FeePayerWallet {
+    wallet_file: WalletFile,
+    pubkey: Pubkey,
+}
+
+impl FeePayerWallet {
+    fn load(ctx: &AppContext, name: &str, trader_authority: Pubkey) -> Result<Self, VulcanError> {
+        let name = name.trim();
+        if name.is_empty() || !ctx.wallet_store.exists(name) {
+            return Err(VulcanError::auth(
+                "FEE_PAYER_WALLET_NOT_FOUND",
+                format!(
+                    "Fee payer wallet '{name}' not found. Use `vulcan wallet list` for stored names."
+                ),
+            ));
+        }
+        let wallet_file = ctx
+            .wallet_store
+            .load(name)
+            .map_err(|e| VulcanError::auth("FEE_PAYER_WALLET_NOT_FOUND", e.to_string()))?;
+        let pubkey = Pubkey::from_str(&wallet_file.public_key)
+            .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
+        if pubkey == trader_authority {
+            return Err(VulcanError::validation(
+                "FEE_PAYER_IS_TRADER",
+                "Fee payer wallet is the same as the trader wallet; omit --fee-payer.",
+            ));
+        }
+        Ok(Self {
+            wallet_file,
+            pubkey,
+        })
     }
-    let wallet_file = ctx
-        .wallet_store
-        .load(name)
-        .map_err(|e| VulcanError::auth("FEE_PAYER_WALLET_NOT_FOUND", e.to_string()))?;
-    let payer = Pubkey::from_str(&wallet_file.public_key)
-        .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
-    if payer == trader_authority {
-        return Err(VulcanError::validation(
-            "FEE_PAYER_IS_TRADER",
-            "Fee payer wallet is the same as the trader wallet; omit --fee-payer.",
-        ));
+
+    /// Unlock the sponsor wallet for signing (prompts for a password if needed).
+    async fn signer(&self) -> Result<ResolvedSigner, VulcanError> {
+        let password = if self.wallet_file.is_local_encrypted() {
+            Some(crate::commands::trade::prompt_password()?)
+        } else {
+            None
+        };
+        ResolvedSigner::from_wallet_file(&self.wallet_file, password.as_deref()).await
     }
-    let password = if wallet_file.is_local_encrypted() {
-        Some(crate::commands::trade::prompt_password()?)
-    } else {
-        None
-    };
-    ResolvedSigner::from_wallet_file(&wallet_file, password.as_deref()).await
 }
 
 /// The SDK's RegisterTrader builder lists the trader as a readonly non-signer.
@@ -699,13 +721,13 @@ async fn submit_referral_activation_tx(
     authority: Pubkey,
     referral_code: String,
     status: ReferralActivationTraderStatus,
-    fee_payer: Option<&str>,
+    fee_payer: Option<&FeePayerWallet>,
 ) -> Result<Option<String>, VulcanError> {
     let trader = TraderKey::new(authority);
     let (wallet, _, _) =
         crate::commands::trade::resolve_wallet_and_pda(ctx, Some(wallet_name)).await?;
     let fee_payer_wallet = match fee_payer {
-        Some(name) => Some(resolve_fee_payer_signer(ctx, name, authority).await?),
+        Some(sponsor) => Some(sponsor.signer().await?),
         None => None,
     };
     let payer = fee_payer_wallet
@@ -805,6 +827,12 @@ async fn register_authority(
     referral_code: Option<String>,
     fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
+    // Validate the sponsor wallet first: it is an offline check, so a bad
+    // --fee-payer fails before any RPC call and is visible in dry runs.
+    let fee_payer_wallet = fee_payer
+        .map(|name| FeePayerWallet::load(ctx, name, authority))
+        .transpose()?;
+
     let status = trader_onboarding_status(ctx, &authority).await?;
 
     let sig = if matches!(status, ReferralActivationTraderStatus::Activated) {
@@ -817,7 +845,15 @@ async fn register_authority(
             .map(|code| code.trim().to_string())
             .filter(|code| !code.is_empty())
             .unwrap_or_else(|| DEFAULT_REFERRAL_CODE.to_string());
-        submit_referral_activation_tx(ctx, wallet_name, authority, code, status, fee_payer).await?
+        submit_referral_activation_tx(
+            ctx,
+            wallet_name,
+            authority,
+            code,
+            status,
+            fee_payer_wallet.as_ref(),
+        )
+        .await?
     };
 
     let trader_key = TraderKey::new(authority);
@@ -826,6 +862,7 @@ async fn register_authority(
         trader_pda: trader_key.pda().to_string(),
         dry_run: ctx.dry_run,
         tx_signature: sig,
+        fee_payer: fee_payer_wallet.map(|w| w.pubkey.to_string()),
     })
 }
 

@@ -27,14 +27,15 @@ fn stripped_env(cmd: &mut Command, fake_home: &std::path::Path) {
         .env_remove("VULCAN_WALLET_PASSWORD");
 }
 
-fn create_default_local_wallet(fake_home: &Path) {
+const TEST_WALLET_PASSWORD: &str = "vulcan-test-password";
+
+/// Create a local encrypted wallet and return its public key.
+fn create_local_wallet(fake_home: &Path, name: &str) -> String {
     let mut create = Command::new(bin());
     stripped_env(&mut create, fake_home);
     let out = create
-        .env("VULCAN_WALLET_PASSWORD", "vulcan-test-password")
-        .args([
-            "--yes", "-o", "json", "wallet", "create", "--name", "mcp-test",
-        ])
+        .env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json", "wallet", "create", "--name", name])
         .output()
         .expect("spawn vulcan wallet create");
     assert!(
@@ -43,6 +44,15 @@ fn create_default_local_wallet(fake_home: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("wallet create JSON");
+    v["data"]["public_key"]
+        .as_str()
+        .expect("wallet create returns public_key")
+        .to_string()
+}
+
+fn create_default_local_wallet(fake_home: &Path) {
+    create_local_wallet(fake_home, "mcp-test");
 
     let mut set_default = Command::new(bin());
     stripped_env(&mut set_default, fake_home);
@@ -254,5 +264,116 @@ fn agent_mcp_install_writes_file_with_0600_perms() {
         0o600,
         "MCP config should be mode 0600, got 0{mode:o} at {}",
         config_path.display()
+    );
+}
+
+// ── Sponsored registration (`account register --fee-payer`) ─────────────
+
+/// Run `account register` with the given extra args and parse the JSON envelope.
+/// The RPC URL points at a closed local port so any network access fails fast
+/// and deterministically with a `network` category error.
+fn register_offline(fake_home: &Path, extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json", "--rpc-url", "http://127.0.0.1:1"])
+        .args(["account", "register"])
+        .args(extra_args);
+    let out = cmd.output().expect("spawn vulcan account register");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+#[test]
+fn register_with_unknown_fee_payer_fails_before_any_network_access() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    let v = register_offline(tmp.path(), &["--fee-payer", "no-such-wallet"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    // The sponsor lookup is offline and must run before the trader-status RPC
+    // call; otherwise the closed port would surface as TRADER_STATUS_FAILED.
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
+    assert_eq!(v["error"]["category"], "auth", "envelope: {v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("no-such-wallet") && msg.contains("vulcan wallet list"),
+        "message should name the wallet and the remedy, got: {msg}"
+    );
+}
+
+#[test]
+fn register_with_trader_as_fee_payer_is_rejected_before_any_network_access() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    // "mcp-test" is the default (trader) wallet; sponsoring yourself is a no-op.
+    let v = register_offline(tmp.path(), &["--fee-payer", "mcp-test"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "FEE_PAYER_IS_TRADER", "envelope: {v}");
+    assert_eq!(v["error"]["category"], "validation", "envelope: {v}");
+}
+
+#[test]
+fn register_with_valid_fee_payer_passes_validation_and_reaches_rpc() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    create_local_wallet(tmp.path(), "sponsor");
+
+    // A distinct stored sponsor clears the offline checks, so the first
+    // failure is the (deliberately unreachable) trader-status RPC call.
+    let v = register_offline(tmp.path(), &["--dry-run", "--fee-payer", "sponsor"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+    assert_eq!(v["error"]["category"], "network", "envelope: {v}");
+}
+
+#[test]
+#[ignore = "needs mainnet RPC access (read-only account fetch); run with --ignored"]
+fn dry_run_sponsored_registration_reports_sponsor_pubkey() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    let sponsor_pubkey = create_local_wallet(tmp.path(), "sponsor");
+
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, tmp.path());
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args([
+            "--yes",
+            "-o",
+            "json",
+            "--dry-run",
+            "account",
+            "register",
+            "--fee-payer",
+            "sponsor",
+        ]);
+    let out = cmd.output().expect("spawn vulcan account register");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+
+    assert_eq!(v["ok"], true, "envelope: {v}");
+    assert_eq!(v["data"]["dry_run"], true, "envelope: {v}");
+    assert_eq!(v["data"]["tx_signature"], serde_json::Value::Null);
+    assert_eq!(v["data"]["fee_payer"], sponsor_pubkey, "envelope: {v}");
+    assert_ne!(
+        v["data"]["authority"], sponsor_pubkey,
+        "trader must differ from sponsor"
     );
 }
