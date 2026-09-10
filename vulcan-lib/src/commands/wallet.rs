@@ -56,6 +56,9 @@ impl TableRenderable for WalletInfo {
 #[derive(Debug, Serialize)]
 pub struct WalletList {
     pub wallets: Vec<WalletInfo>,
+    /// Linked paymaster wallet name, if any (`vulcan wallet set-fee-payer`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<String>,
 }
 
 impl TableRenderable for WalletList {
@@ -81,6 +84,9 @@ impl TableRenderable for WalletList {
             })
             .collect();
         crate::output::table::render_table(&["Name", "Public Key", "Signer", "Default"], rows);
+        if let Some(fee_payer) = &self.fee_payer {
+            println!("Fee payer (paymaster): {fee_payer}");
+        }
     }
 }
 
@@ -159,6 +165,44 @@ impl TableRenderable for WalletBalance {
         println!("  Address: {}", self.address);
         println!("  SOL:     {:.9} SOL", self.sol);
         println!("  USDC:    {:.6} USDC", self.usdc);
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeePayerSet {
+    pub name: String,
+    pub public_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+impl TableRenderable for FeePayerSet {
+    fn render_table(&self) {
+        println!(
+            "Fee payer set to '{}' ({}). It now pays fees and rent for every transaction; fund it with SOL.",
+            self.name, self.public_key
+        );
+        if let Some(prev) = self.previous.as_ref().filter(|p| *p != &self.name) {
+            println!("(was '{prev}'.)");
+        }
+        println!("Unlink with `vulcan wallet clear-fee-payer`, or override once with `--fee-payer <name>`.");
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeePayerCleared {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<String>,
+}
+
+impl TableRenderable for FeePayerCleared {
+    fn render_table(&self) {
+        match &self.previous {
+            Some(prev) => {
+                println!("Fee payer '{prev}' unlinked. The trader wallet pays its own fees.")
+            }
+            None => println!("No fee payer was linked."),
+        }
     }
 }
 
@@ -282,7 +326,8 @@ pub async fn execute(ctx: &AppContext, cmd: WalletCommand) -> Result<(), VulcanE
                 })
                 .collect();
 
-            let result = WalletList { wallets };
+            let fee_payer = ctx.wallet_store.fee_payer().ok().flatten();
+            let result = WalletList { wallets, fee_payer };
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
         }
@@ -312,6 +357,38 @@ pub async fn execute(ctx: &AppContext, cmd: WalletCommand) -> Result<(), VulcanE
                 .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
 
             let result = DefaultSet { name, previous };
+            render_success(ctx.output_format, &result, serde_json::Value::Null);
+            Ok(())
+        }
+
+        WalletCommand::SetFeePayer { name } => {
+            let previous = ctx.wallet_store.fee_payer().ok().flatten();
+            let wallet_file = ctx
+                .wallet_store
+                .load(&name)
+                .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
+            ctx.wallet_store
+                .set_fee_payer(&name)
+                .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
+
+            let result = FeePayerSet {
+                name,
+                public_key: wallet_file.public_key,
+                previous,
+            };
+            render_success(ctx.output_format, &result, serde_json::Value::Null);
+            Ok(())
+        }
+
+        WalletCommand::ClearFeePayer => {
+            let previous = ctx.wallet_store.clear_fee_payer().map_err(|e| {
+                VulcanError::new(
+                    crate::error::ErrorCategory::Io,
+                    "FEE_PAYER_CLEAR_FAILED",
+                    e.to_string(),
+                )
+            })?;
+            let result = FeePayerCleared { previous };
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
         }
@@ -711,7 +788,8 @@ pub fn execute_list_inner(ctx: &AppContext) -> Result<WalletList, VulcanError> {
         })
         .collect();
 
-    Ok(WalletList { wallets })
+    let fee_payer = ctx.wallet_store.fee_payer().ok().flatten();
+    Ok(WalletList { wallets, fee_payer })
 }
 
 pub fn execute_create_inner(

@@ -1,10 +1,11 @@
 //! Account command execution.
 
 use crate::cli::account::AccountCommand;
+use crate::commands::fee_payer::{resolve_fee_payer, FeePayerWallet};
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
-use crate::wallet::{ResolvedSigner, WalletFile};
+use crate::wallet::ResolvedSigner;
 use phoenix_rise::accounts::owned::Permission;
 use phoenix_rise::accounts::permission::TRADER_ONBOARDING_PERMISSION;
 use phoenix_rise::api::{
@@ -270,19 +271,10 @@ fn resolve_authority(ctx: &AppContext) -> Result<(String, Pubkey), VulcanError> 
 
 pub async fn execute(ctx: &AppContext, cmd: AccountCommand) -> Result<(), VulcanError> {
     match cmd {
-        AccountCommand::Register {
-            referral_code,
-            fee_payer,
-        } => {
+        AccountCommand::Register { referral_code } => {
             let (wallet_name, authority) = resolve_authority(ctx)?;
-            let result = register_authority(
-                ctx,
-                &wallet_name,
-                authority,
-                referral_code,
-                fee_payer.as_deref(),
-            )
-            .await?;
+            let result =
+                register_authority(ctx, &wallet_name, authority, referral_code, None).await?;
 
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
@@ -549,56 +541,6 @@ async fn sign_onboarding_transaction_for_api(
     Ok((transaction, recent_blockhash.to_string(), fee_payer))
 }
 
-/// A stored sponsor wallet validated for `--fee-payer`, before any network access.
-///
-/// Loading is offline (wallet-store lookup and pubkey checks) so a bad flag fails
-/// fast and dry runs can report the sponsor. The signer is only unlocked when a
-/// transaction is actually submitted.
-struct FeePayerWallet {
-    wallet_file: WalletFile,
-    pubkey: Pubkey,
-}
-
-impl FeePayerWallet {
-    fn load(ctx: &AppContext, name: &str, trader_authority: Pubkey) -> Result<Self, VulcanError> {
-        let name = name.trim();
-        if name.is_empty() || !ctx.wallet_store.exists(name) {
-            return Err(VulcanError::auth(
-                "FEE_PAYER_WALLET_NOT_FOUND",
-                format!(
-                    "Fee payer wallet '{name}' not found. Use `vulcan wallet list` for stored names."
-                ),
-            ));
-        }
-        let wallet_file = ctx
-            .wallet_store
-            .load(name)
-            .map_err(|e| VulcanError::auth("FEE_PAYER_WALLET_NOT_FOUND", e.to_string()))?;
-        let pubkey = Pubkey::from_str(&wallet_file.public_key)
-            .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
-        if pubkey == trader_authority {
-            return Err(VulcanError::validation(
-                "FEE_PAYER_IS_TRADER",
-                "Fee payer wallet is the same as the trader wallet; omit --fee-payer.",
-            ));
-        }
-        Ok(Self {
-            wallet_file,
-            pubkey,
-        })
-    }
-
-    /// Unlock the sponsor wallet for signing (prompts for a password if needed).
-    async fn signer(&self) -> Result<ResolvedSigner, VulcanError> {
-        let password = if self.wallet_file.is_local_encrypted() {
-            Some(crate::commands::trade::prompt_password()?)
-        } else {
-            None
-        };
-        ResolvedSigner::from_wallet_file(&self.wallet_file, password.as_deref()).await
-    }
-}
-
 /// The SDK's RegisterTrader builder lists the trader as a readonly non-signer.
 /// When someone else pays, the trader must co-sign to authorize the registration.
 fn mark_trader_as_signer(ix: &mut solana_sdk::instruction::Instruction, trader: &Pubkey) {
@@ -828,10 +770,8 @@ async fn register_authority(
     fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     // Validate the sponsor wallet first: it is an offline check, so a bad
-    // --fee-payer fails before any RPC call and is visible in dry runs.
-    let fee_payer_wallet = fee_payer
-        .map(|name| FeePayerWallet::load(ctx, name, authority))
-        .transpose()?;
+    // fee payer fails before any RPC call and is visible in dry runs.
+    let fee_payer_wallet = resolve_fee_payer(ctx, fee_payer, authority)?;
 
     let status = trader_onboarding_status(ctx, &authority).await?;
 

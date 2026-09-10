@@ -170,11 +170,11 @@
     },
     "FEE_PAYER_WALLET_NOT_FOUND": {
       "category": "auth",
-      "recovery": "The --fee-payer wallet name is not in the local wallet store. Check `vulcan wallet list` or import the sponsor wallet first"
+      "recovery": "The fee payer wallet (global --fee-payer or `vulcan wallet set-fee-payer`) is not in the local wallet store. Check `vulcan wallet list`, import the sponsor wallet, or run `vulcan wallet clear-fee-payer`"
     },
     "FEE_PAYER_IS_TRADER": {
       "category": "validation",
-      "recovery": "The fee payer wallet is the trader wallet itself. Omit --fee-payer or choose a different sponsor wallet"
+      "recovery": "The fee payer wallet is the trader wallet itself. Omit --fee-payer, run `vulcan wallet clear-fee-payer`, or choose a different sponsor wallet"
     },
     "FEE_PAYER_TX_SIGN_FAILED": {
       "category": "auth",

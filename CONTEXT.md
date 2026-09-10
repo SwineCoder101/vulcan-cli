@@ -172,6 +172,10 @@ For a market order sized with `tokens` or `notional_usdc`:
 
 `vulcan_market_ticker` is recommended for user-facing context, not required for lot conversion. If passing base-lot `size`, call `vulcan_market_info` first.
 
+## Fee Payer (Paymaster)
+
+Transaction fees and trader-account rent are paid by the trader wallet unless a paymaster is linked with `vulcan wallet set-fee-payer <NAME>` (or overridden per run with the global `--fee-payer <NAME>`). The paymaster must be a stored wallet; it co-signs every transaction as fee payer, the trader wallet still signs, and it gains no authority over funds or positions. When linked, only the paymaster needs SOL. Missing or same-as-trader paymasters fail before any network call with `FEE_PAYER_WALLET_NOT_FOUND` / `FEE_PAYER_IS_TRADER`. `vulcan wallet list` shows the linked paymaster.
+
 ## Error Handling
 
 Failures use this envelope:

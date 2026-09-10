@@ -269,6 +269,23 @@ fn agent_mcp_install_writes_file_with_0600_perms() {
 
 // ── Sponsored registration (`account register --fee-payer`) ─────────────
 
+/// Run any command with the test wallet password and parse the JSON envelope.
+fn run_json(fake_home: &Path, args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json"])
+        .args(args);
+    let out = cmd.output().expect("spawn vulcan");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 /// Run `account register` with the given extra args and parse the JSON envelope.
 /// The RPC URL points at a closed local port so any network access fails fast
 /// and deterministically with a `network` category error.
@@ -376,4 +393,65 @@ fn dry_run_sponsored_registration_reports_sponsor_pubkey() {
         v["data"]["authority"], sponsor_pubkey,
         "trader must differ from sponsor"
     );
+}
+
+// ── Linked paymaster (`wallet set-fee-payer` / global `--fee-payer`) ─────
+
+#[test]
+fn set_fee_payer_rejects_unknown_wallet() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    let v = run_json(tmp.path(), &["wallet", "set-fee-payer", "no-such-wallet"]);
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "WALLET_NOT_FOUND", "envelope: {v}");
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert!(
+        list["data"]["fee_payer"].is_null(),
+        "no paymaster should be linked after a failed set, got {list}"
+    );
+}
+
+#[test]
+fn linked_paymaster_is_used_by_register_and_can_be_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    let sponsor_pubkey = create_local_wallet(tmp.path(), "sponsor");
+
+    let set = run_json(tmp.path(), &["wallet", "set-fee-payer", "sponsor"]);
+    assert_eq!(set["ok"], true, "envelope: {set}");
+    assert_eq!(set["data"]["name"], "sponsor");
+    assert_eq!(set["data"]["public_key"], sponsor_pubkey);
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert_eq!(list["data"]["fee_payer"], "sponsor", "envelope: {list}");
+
+    // No flag: the linked paymaster clears the offline checks, so the first
+    // failure is the (deliberately unreachable) trader-status RPC call.
+    let v = register_offline(tmp.path(), &[]);
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+
+    // A global --fee-payer placed before the subcommand overrides the link.
+    let v = register_offline_with_global(tmp.path(), &["--fee-payer", "mcp-test"]);
+    assert_eq!(v["error"]["code"], "FEE_PAYER_IS_TRADER", "envelope: {v}");
+
+    let cleared = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
+    assert_eq!(cleared["ok"], true, "envelope: {cleared}");
+    assert_eq!(cleared["data"]["previous"], "sponsor");
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert!(list["data"]["fee_payer"].is_null(), "envelope: {list}");
+
+    let cleared_again = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
+    assert_eq!(cleared_again["ok"], true, "envelope: {cleared_again}");
+    assert!(cleared_again["data"]["previous"].is_null());
+}
+
+/// Like `register_offline`, but `global_args` go before the subcommand.
+fn register_offline_with_global(fake_home: &Path, global_args: &[&str]) -> serde_json::Value {
+    let mut args = vec!["--rpc-url", "http://127.0.0.1:1"];
+    args.extend_from_slice(global_args);
+    args.extend_from_slice(&["account", "register"]);
+    run_json(fake_home, &args)
 }

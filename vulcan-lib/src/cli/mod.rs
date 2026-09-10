@@ -50,6 +50,11 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub wallet: Option<String>,
 
+    /// Stored wallet name that pays transaction fees and registration rent instead of the
+    /// trader wallet (paymaster). Overrides the linked one from `vulcan wallet set-fee-payer`.
+    #[arg(long, global = true)]
+    pub fee_payer: Option<String>,
+
     /// Enable verbose/debug logging to stderr
     #[arg(short, long, default_value = "false", global = true)]
     pub verbose: bool,

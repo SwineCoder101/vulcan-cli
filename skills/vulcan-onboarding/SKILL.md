@@ -92,7 +92,7 @@ vulcan wallet set-default <NAME>
 
 The wallet needs:
 
-- **SOL** — for Solana transaction fees (~0.01 SOL per transaction).
+- **SOL** — for Solana transaction fees (~0.01 SOL per transaction). Skip this when a paymaster is linked (`vulcan wallet set-fee-payer`); then only the paymaster needs SOL.
 - **USDC** — for trading collateral.
 
 After wallet creation, give the user the wallet public key so they can fund it externally. Funding happens outside Vulcan through a wallet transfer, exchange withdrawal, or similar flow. In MCP, prefer the explicit address helper:
@@ -116,7 +116,7 @@ A referral code is optional: when the user has one, pass it; when omitted, Vulca
 ```bash
 vulcan account register
 vulcan account register --referral-code <CODE>
-vulcan account register --referral-code <CODE> --fee-payer <SPONSOR_WALLET>
+vulcan --fee-payer <SPONSOR_WALLET> account register --referral-code <CODE>
 ```
 
 For MCP:
@@ -128,7 +128,7 @@ vulcan_account_register → { referral_code: "YOUR_CODE", acknowledged: true }
 
 Registration submits a signed onboarding transaction for the default cross-margin subaccount via `/v1/referral/activate-tx`; the wallet pays the transaction fee and trader-account rent, and the API adds the onboarder co-signature. If the trader is already registered, verify with `vulcan_account_info`.
 
-**Sponsored registration.** When the trader wallet holds no SOL, pass `--fee-payer <SPONSOR_WALLET>` (or `fee_payer` in `vulcan_account_register`). The sponsor must be a stored wallet; it pays the fee and rent, the trader wallet still co-signs to authorize its own registration, and the SOL preflight checks the sponsor's balance instead. Both wallets are unlocked with the same `VULCAN_WALLET_PASSWORD` when they are local encrypted wallets. The sponsor wallet is validated before any network call, so a missing or same-as-trader sponsor fails immediately (`FEE_PAYER_WALLET_NOT_FOUND`, `FEE_PAYER_IS_TRADER`), and `--dry-run` reports the resolved sponsor pubkey as `fee_payer` without unlocking it.
+**Sponsored registration (paymaster).** When the trader wallet holds no SOL, link a funded stored wallet as paymaster with `vulcan wallet set-fee-payer <SPONSOR_WALLET>` (or pass the global `--fee-payer <SPONSOR_WALLET>` for one command, or `fee_payer` in `vulcan_account_register`). The sponsor pays the fee and rent for registration and for every later transaction (deposits, trades, withdrawals); the trader wallet still co-signs, and the SOL preflight checks the sponsor's balance instead. Both wallets are unlocked with the same `VULCAN_WALLET_PASSWORD` when they are local encrypted wallets. The sponsor is validated before any network call, so a missing or same-as-trader sponsor fails immediately (`FEE_PAYER_WALLET_NOT_FOUND`, `FEE_PAYER_IS_TRADER`), and `--dry-run` reports the resolved sponsor pubkey as `fee_payer` without unlocking it.
 
 ## Step 5: Deposit Collateral
 

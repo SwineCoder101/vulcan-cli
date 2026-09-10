@@ -504,11 +504,19 @@ pub async fn send_or_dry_run_with_cu_limit(
     wallet: &ResolvedSigner,
     cu_limit: u32,
 ) -> Result<Option<String>, VulcanError> {
+    // Offline validation of the linked paymaster (if any) runs even in dry-run
+    // mode so a broken `--fee-payer` / `wallet set-fee-payer` surfaces early.
+    let sponsor = crate::commands::fee_payer::resolve_fee_payer(ctx, None, wallet.authority)?;
+
     if ctx.dry_run {
         return Ok(None);
     }
 
     let signer = wallet.signer()?;
+    let sponsor_signer = match &sponsor {
+        Some(sponsor) => Some(sponsor.signer().await?),
+        None => None,
+    };
 
     let rpc_client = ctx.rpc_client();
 
@@ -523,37 +531,139 @@ pub async fn send_or_dry_run_with_cu_limit(
     );
     all_ixs.extend(ixs);
 
-    let fee_payer = signer.pubkey();
-    if fee_payer != wallet.authority {
+    let trader_pubkey = signer.pubkey();
+    if trader_pubkey != wallet.authority {
         return Err(VulcanError::auth(
             "SIGNER_PUBKEY_MISMATCH",
             format!(
                 "Signer pubkey {} does not match active wallet authority {}",
-                fee_payer, wallet.authority
+                trader_pubkey, wallet.authority
             ),
         ));
     }
+    // The paymaster, when linked, is the fee payer (first signer); the trader
+    // still signs to authorize the instructions themselves.
+    let fee_payer = sponsor.as_ref().map(|s| s.pubkey).unwrap_or(trader_pubkey);
 
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&all_ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
 
-    let signed = signer
-        .sign_transaction(&mut tx)
-        .await
-        .map_err(|e| VulcanError::auth("TX_SIGN_FAILED", e.to_string()))?;
-
-    if matches!(signed, SignTransactionResult::Partial(_)) {
-        return Err(VulcanError::auth(
-            "PARTIAL_SIGNATURE",
-            "Transaction was only partially signed; Vulcan live transactions currently require one complete signer.",
-        ));
-    }
+    let sponsor_dyn: Option<&dyn solana_keychain::SolanaSigner> = match &sponsor_signer {
+        Some(s) => Some(s.signer()?),
+        None => None,
+    };
+    sign_fully(&mut tx, signer, sponsor_dyn).await?;
 
     let sig = rpc_client
         .send_and_confirm_transaction(&tx)
         .map_err(|e| VulcanError::tx_failed("TX_SEND_FAILED", e.to_string()))?;
 
     Ok(Some(sig.to_string()))
+}
+
+/// Sign `tx` with the trader and, when a paymaster is linked, the fee payer.
+///
+/// Each signer fills only its own slot, so signing sequentially accumulates
+/// signatures on the same transaction: trader first, then the paymaster. The
+/// result must be fully signed; Vulcan never submits a partial transaction.
+async fn sign_fully(
+    tx: &mut solana_sdk::transaction::Transaction,
+    trader: &dyn solana_keychain::SolanaSigner,
+    fee_payer: Option<&dyn solana_keychain::SolanaSigner>,
+) -> Result<(), VulcanError> {
+    let mut signed = trader
+        .sign_transaction(tx)
+        .await
+        .map_err(|e| VulcanError::auth("TX_SIGN_FAILED", e.to_string()))?;
+    if let Some(fee_payer) = fee_payer {
+        signed = fee_payer
+            .sign_transaction(tx)
+            .await
+            .map_err(|e| VulcanError::auth("FEE_PAYER_TX_SIGN_FAILED", e.to_string()))?;
+    }
+    if matches!(signed, SignTransactionResult::Partial(_)) {
+        return Err(VulcanError::auth(
+            "PARTIAL_SIGNATURE",
+            "Transaction was only partially signed; every required signer (trader wallet and, when linked, the fee payer) must sign before submission.",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod fee_payer_signing_tests {
+    use super::*;
+    use solana_sdk::signature::{Keypair, Signer as _};
+
+    fn trader_ix(trader: Pubkey) -> solana_sdk::instruction::Instruction {
+        solana_sdk::instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![solana_sdk::instruction::AccountMeta::new(trader, true)],
+            data: vec![],
+        }
+    }
+
+    fn dyn_signer(kp: &Keypair) -> solana_keychain::MemorySigner {
+        solana_keychain::MemorySigner::from_bytes(&kp.to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn paymaster_pays_and_both_signatures_verify() {
+        let trader_kp = Keypair::new();
+        let sponsor_kp = Keypair::new();
+        let (trader, sponsor) = (trader_kp.pubkey(), sponsor_kp.pubkey());
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader)],
+            Some(&sponsor),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        assert_eq!(
+            tx.message.account_keys[0], sponsor,
+            "paymaster is the fee payer"
+        );
+        assert_eq!(tx.message.header.num_required_signatures, 2);
+
+        sign_fully(
+            &mut tx,
+            &dyn_signer(&trader_kp),
+            Some(&dyn_signer(&sponsor_kp)),
+        )
+        .await
+        .expect("fully signed");
+        assert!(tx.verify_with_results().iter().all(|ok| *ok));
+    }
+
+    #[tokio::test]
+    async fn missing_paymaster_signature_is_rejected() {
+        let trader_kp = Keypair::new();
+        let sponsor = Keypair::new().pubkey();
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader_kp.pubkey())],
+            Some(&sponsor),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+
+        let err = sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
+            .await
+            .expect_err("sponsor slot left empty");
+        assert_eq!(err.code, "PARTIAL_SIGNATURE");
+    }
+
+    #[tokio::test]
+    async fn trader_alone_pays_without_paymaster() {
+        let trader_kp = Keypair::new();
+        let trader = trader_kp.pubkey();
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader)],
+            Some(&trader),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+
+        sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
+            .await
+            .expect("single signer suffices");
+        assert!(tx.verify_with_results().iter().all(|ok| *ok));
+    }
 }
 
 /// Build a conditional-orders account init instruction when the PDA is missing

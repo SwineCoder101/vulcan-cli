@@ -300,6 +300,37 @@ impl WalletStore {
         std::fs::write(default_path, name)?;
         Ok(())
     }
+
+    /// Linked fee-payer (paymaster) wallet name, if one is set and still exists.
+    pub fn fee_payer(&self) -> Result<Option<String>> {
+        let path = self.wallets_dir.join("fee_payer");
+        if path.exists() {
+            let name = std::fs::read_to_string(&path)?.trim().to_string();
+            if self.exists(&name) {
+                return Ok(Some(name));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Link a stored wallet as the fee payer for every transaction.
+    pub fn set_fee_payer(&self, name: &str) -> Result<()> {
+        if !self.exists(name) {
+            return Err(anyhow!("Wallet '{}' not found", name));
+        }
+        std::fs::write(self.wallets_dir.join("fee_payer"), name)?;
+        Ok(())
+    }
+
+    /// Unlink the fee payer; the trader wallet pays its own fees again.
+    pub fn clear_fee_payer(&self) -> Result<Option<String>> {
+        let previous = self.fee_payer()?;
+        let path = self.wallets_dir.join("fee_payer");
+        if path.exists() {
+            std::fs::remove_file(path)?;
+        }
+        Ok(previous)
+    }
 }
 
 #[cfg(test)]
