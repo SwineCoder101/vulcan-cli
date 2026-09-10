@@ -832,7 +832,7 @@ async fn register_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::Signature;
+    use solana_sdk::signature::{Signature, Signer as _};
 
     fn two_signer_onboarding_tx(
         authority: Pubkey,
@@ -887,5 +887,173 @@ mod tests {
         assert_eq!(format_sol_lamports(1), "0.000000001");
         assert_eq!(format_sol_lamports(1_500_000_000), "1.5");
         assert_eq!(format_sol_lamports(2_000_000_000), "2.0");
+    }
+
+    // ── Sponsored registration (--fee-payer) ─────────────────────────────
+
+    fn sponsored_register_ix(
+        payer: Pubkey,
+        trader: Pubkey,
+    ) -> solana_sdk::instruction::Instruction {
+        let trader_key = TraderKey::new(trader);
+        let params = RegisterTraderParams::builder()
+            .payer(payer)
+            .trader(trader)
+            .trader_account(trader_key.pda())
+            .max_positions(CROSS_MARGIN_MAX_POSITIONS as u64)
+            .trader_pda_index(0)
+            .subaccount_index(0)
+            .build()
+            .expect("register params");
+        create_register_trader_ix(params)
+            .expect("register ix")
+            .into()
+    }
+
+    /// Stand-in for OnboardTraderDelegated: only the onboarder is a signer.
+    fn onboarder_only_ix(onboarder: Pubkey) -> solana_sdk::instruction::Instruction {
+        solana_sdk::instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![solana_sdk::instruction::AccountMeta::new_readonly(
+                onboarder, true,
+            )],
+            data: vec![],
+        }
+    }
+
+    fn memory_signer(keypair: &solana_sdk::signature::Keypair) -> solana_keychain::MemorySigner {
+        solana_keychain::MemorySigner::from_bytes(&keypair.to_bytes()).expect("memory signer")
+    }
+
+    #[test]
+    fn mark_trader_as_signer_flips_only_the_trader_meta() {
+        let payer = Pubkey::new_unique();
+        let trader = Pubkey::new_unique();
+        let mut ix = sponsored_register_ix(payer, trader);
+
+        let before: Vec<_> = ix
+            .accounts
+            .iter()
+            .map(|m| (m.pubkey, m.is_signer, m.is_writable))
+            .collect();
+        let trader_meta = ix
+            .accounts
+            .iter()
+            .find(|m| m.pubkey == trader)
+            .expect("trader meta");
+        assert!(
+            !trader_meta.is_signer,
+            "SDK builder lists the trader as a non-signer"
+        );
+
+        mark_trader_as_signer(&mut ix, &trader);
+
+        for (meta, (pubkey, was_signer, was_writable)) in ix.accounts.iter().zip(before) {
+            assert_eq!(meta.pubkey, pubkey);
+            assert_eq!(
+                meta.is_writable, was_writable,
+                "writability must not change"
+            );
+            if pubkey == trader {
+                assert!(meta.is_signer, "trader must become a signer");
+            } else {
+                assert_eq!(meta.is_signer, was_signer, "other metas must be untouched");
+            }
+        }
+        let payer_meta = ix
+            .accounts
+            .iter()
+            .find(|m| m.pubkey == payer)
+            .expect("payer meta");
+        assert!(payer_meta.is_signer && payer_meta.is_writable);
+    }
+
+    #[tokio::test]
+    async fn sponsored_registration_accumulates_trader_and_payer_signatures() {
+        use solana_keychain::SolanaSigner;
+
+        let payer_kp = solana_sdk::signature::Keypair::new();
+        let trader_kp = solana_sdk::signature::Keypair::new();
+        let payer = payer_kp.pubkey();
+        let trader = trader_kp.pubkey();
+        let onboarder = Pubkey::new_unique();
+
+        let mut register_ix = sponsored_register_ix(payer, trader);
+        mark_trader_as_signer(&mut register_ix, &trader);
+        let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
+
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        assert_eq!(tx.message.header.num_required_signatures, 3);
+        assert_eq!(
+            tx.message.account_keys[0], payer,
+            "sponsor must be the fee payer"
+        );
+        let message_before = tx.message_data();
+
+        // Same order as sign_onboarding_transaction_for_api: trader first, then sponsor.
+        let first = memory_signer(&trader_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("trader sign");
+        assert!(matches!(first, SignTransactionResult::Partial(_)));
+        let second = memory_signer(&payer_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("payer sign");
+        assert!(
+            matches!(second, SignTransactionResult::Partial(_)),
+            "onboarder slot is still open, so the tx must remain partial"
+        );
+
+        assert_eq!(
+            tx.message_data(),
+            message_before,
+            "signing must not alter the message"
+        );
+        let verified = tx.verify_with_results();
+        let slot = |key: &Pubkey| {
+            tx.message
+                .account_keys
+                .iter()
+                .position(|k| k == key)
+                .unwrap()
+        };
+        assert!(verified[slot(&payer)], "sponsor signature must verify");
+        assert!(verified[slot(&trader)], "trader signature must verify");
+        assert_eq!(tx.signatures[slot(&onboarder)], Signature::default());
+
+        validate_partial_onboarding_signatures(&tx, &onboarder)
+            .expect("only the onboarder slot may be missing");
+
+        // The serialized payload handed to the API carries both local signatures.
+        let (serialized, _) = second.into_signed_transaction();
+        assert!(!serialized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sponsored_registration_without_payer_signature_is_rejected() {
+        use solana_keychain::SolanaSigner;
+
+        let payer_kp = solana_sdk::signature::Keypair::new();
+        let trader_kp = solana_sdk::signature::Keypair::new();
+        let payer = payer_kp.pubkey();
+        let trader = trader_kp.pubkey();
+        let onboarder = Pubkey::new_unique();
+
+        let mut register_ix = sponsored_register_ix(payer, trader);
+        mark_trader_as_signer(&mut register_ix, &trader);
+        let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+
+        memory_signer(&trader_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("trader sign");
+
+        let err = validate_partial_onboarding_signatures(&tx, &onboarder)
+            .expect_err("missing sponsor signature must be rejected");
+        assert!(err.to_string().contains(&payer.to_string()));
     }
 }
