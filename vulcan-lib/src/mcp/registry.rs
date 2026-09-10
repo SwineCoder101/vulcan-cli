@@ -893,13 +893,14 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "vulcan_account_register",
-        description: "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code.",
+        description: "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code. Pass fee_payer (a stored wallet name) to have that wallet pay the fee and rent instead of the trader wallet.",
         group: "account",
         dangerous: true,
         schema: || json!({
             "type": "object",
             "properties": {
                 "referral_code": { "type": "string", "description": "Referral code (optional; the default code is used when omitted)" },
+                "fee_payer": { "type": "string", "description": "Stored wallet name that pays the transaction fee and trader-account rent (optional; sponsored registration, both wallets sign)" },
                 "acknowledged": { "type": "boolean", "description": "Must be true to execute" }
             },
             "required": ["acknowledged"],

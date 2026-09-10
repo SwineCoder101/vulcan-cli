@@ -1121,7 +1121,7 @@
       "name": "vulcan_account_register",
       "command": "vulcan account register",
       "group": "account",
-      "description": "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code.",
+      "description": "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code. Pass fee_payer (a stored wallet name) to have that wallet pay the fee and rent instead of the trader wallet.",
       "auth_required": true,
       "dangerous": true,
       "parameters": [
@@ -1130,6 +1130,12 @@
           "type": "string",
           "required": false,
           "description": "Referral code (optional; the default code is used when omitted)"
+        },
+        {
+          "name": "fee_payer",
+          "type": "string",
+          "required": false,
+          "description": "Stored wallet name that pays the transaction fee and trader-account rent (optional; sponsored registration, both wallets sign)"
         },
         {
           "name": "acknowledged",

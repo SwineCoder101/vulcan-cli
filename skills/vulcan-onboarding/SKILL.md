@@ -116,6 +116,7 @@ A referral code is optional: when the user has one, pass it; when omitted, Vulca
 ```bash
 vulcan account register
 vulcan account register --referral-code <CODE>
+vulcan account register --referral-code <CODE> --fee-payer <SPONSOR_WALLET>
 ```
 
 For MCP:
@@ -126,6 +127,8 @@ vulcan_account_register → { referral_code: "YOUR_CODE", acknowledged: true }
 ```
 
 Registration submits a signed onboarding transaction for the default cross-margin subaccount via `/v1/referral/activate-tx`; the wallet pays the transaction fee and trader-account rent, and the API adds the onboarder co-signature. If the trader is already registered, verify with `vulcan_account_info`.
+
+**Sponsored registration.** When the trader wallet holds no SOL, pass `--fee-payer <SPONSOR_WALLET>` (or `fee_payer` in `vulcan_account_register`). The sponsor must be a stored wallet; it pays the fee and rent, the trader wallet still co-signs to authorize its own registration, and the SOL preflight checks the sponsor's balance instead. Both wallets are unlocked with the same `VULCAN_WALLET_PASSWORD` when they are local encrypted wallets.
 
 ## Step 5: Deposit Collateral
 

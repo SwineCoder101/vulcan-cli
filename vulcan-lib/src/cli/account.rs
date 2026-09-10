@@ -9,6 +9,11 @@ pub enum AccountCommand {
         /// Referral code (optional; the default code is used when omitted)
         #[arg(long)]
         referral_code: Option<String>,
+
+        /// Stored wallet name that pays the transaction fee and trader-account rent
+        /// instead of the trader wallet (sponsored registration). Both wallets sign.
+        #[arg(long)]
+        fee_payer: Option<String>,
     },
 
     /// Show trader account details (PDA, subaccounts, margin mode)

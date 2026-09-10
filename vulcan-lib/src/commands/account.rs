@@ -264,9 +264,19 @@ fn resolve_authority(ctx: &AppContext) -> Result<(String, Pubkey), VulcanError> 
 
 pub async fn execute(ctx: &AppContext, cmd: AccountCommand) -> Result<(), VulcanError> {
     match cmd {
-        AccountCommand::Register { referral_code } => {
+        AccountCommand::Register {
+            referral_code,
+            fee_payer,
+        } => {
             let (wallet_name, authority) = resolve_authority(ctx)?;
-            let result = register_authority(ctx, &wallet_name, authority, referral_code).await?;
+            let result = register_authority(
+                ctx,
+                &wallet_name,
+                authority,
+                referral_code,
+                fee_payer.as_deref(),
+            )
+            .await?;
 
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
@@ -445,15 +455,17 @@ pub async fn execute_info_inner(ctx: &AppContext) -> Result<AccountInfoResult, V
 pub async fn execute_register_inner(
     ctx: &AppContext,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     let (wallet_name, authority) = resolve_authority(ctx)?;
-    register_authority(ctx, &wallet_name, authority, referral_code).await
+    register_authority(ctx, &wallet_name, authority, referral_code, fee_payer).await
 }
 
 pub async fn execute_register_wallet_inner(
     ctx: &AppContext,
     wallet_name: &str,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     let wallet_file = ctx
         .wallet_store
@@ -461,26 +473,45 @@ pub async fn execute_register_wallet_inner(
         .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
     let authority = Pubkey::from_str(&wallet_file.public_key)
         .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
-    register_authority(ctx, wallet_name, authority, referral_code).await
+    register_authority(ctx, wallet_name, authority, referral_code, fee_payer).await
 }
 
 async fn sign_onboarding_transaction_for_api(
     ctx: &AppContext,
     wallet: &ResolvedSigner,
+    fee_payer_wallet: Option<&ResolvedSigner>,
     ixs: Vec<solana_sdk::instruction::Instruction>,
     trader_onboarder: Pubkey,
 ) -> Result<(String, String, Pubkey), VulcanError> {
     let signer = wallet.signer()?;
-    let fee_payer = signer.pubkey();
-    if fee_payer != wallet.authority {
+    let trader_pubkey = signer.pubkey();
+    if trader_pubkey != wallet.authority {
         return Err(VulcanError::auth(
             "SIGNER_PUBKEY_MISMATCH",
             format!(
                 "Signer pubkey {} does not match active wallet authority {}",
-                fee_payer, wallet.authority
+                trader_pubkey, wallet.authority
             ),
         ));
     }
+    let payer_signer = match fee_payer_wallet {
+        Some(w) => {
+            let s = w.signer()?;
+            if s.pubkey() != w.authority {
+                return Err(VulcanError::auth(
+                    "SIGNER_PUBKEY_MISMATCH",
+                    format!(
+                        "Fee payer signer pubkey {} does not match wallet authority {}",
+                        s.pubkey(),
+                        w.authority
+                    ),
+                ));
+            }
+            Some(s)
+        }
+        None => None,
+    };
+    let fee_payer = payer_signer.map(|s| s.pubkey()).unwrap_or(trader_pubkey);
 
     simulate_onboarding_transaction(ctx, &ixs, fee_payer).await?;
 
@@ -491,16 +522,69 @@ async fn sign_onboarding_transaction_for_api(
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
 
-    let signed = signer
+    // Each signer fills only its own signature slot, so signing sequentially
+    // accumulates signatures on the same transaction.
+    let mut signed = signer
         .sign_transaction(&mut tx)
         .await
         .map_err(|e| VulcanError::auth("TX_SIGN_FAILED", e.to_string()))?;
+    if let Some(payer_signer) = payer_signer {
+        signed = payer_signer
+            .sign_transaction(&mut tx)
+            .await
+            .map_err(|e| VulcanError::auth("FEE_PAYER_TX_SIGN_FAILED", e.to_string()))?;
+    }
     if matches!(signed, SignTransactionResult::Partial(_)) {
         validate_partial_onboarding_signatures(&tx, &trader_onboarder)?;
     }
 
     let (transaction, _) = signed.into_signed_transaction();
     Ok((transaction, recent_blockhash.to_string(), fee_payer))
+}
+
+/// Resolve a stored wallet as the sponsored fee payer for registration.
+async fn resolve_fee_payer_signer(
+    ctx: &AppContext,
+    name: &str,
+    trader_authority: Pubkey,
+) -> Result<ResolvedSigner, VulcanError> {
+    let name = name.trim();
+    if name.is_empty() || !ctx.wallet_store.exists(name) {
+        return Err(VulcanError::auth(
+            "FEE_PAYER_WALLET_NOT_FOUND",
+            format!(
+                "Fee payer wallet '{name}' not found. Use `vulcan wallet list` for stored names."
+            ),
+        ));
+    }
+    let wallet_file = ctx
+        .wallet_store
+        .load(name)
+        .map_err(|e| VulcanError::auth("FEE_PAYER_WALLET_NOT_FOUND", e.to_string()))?;
+    let payer = Pubkey::from_str(&wallet_file.public_key)
+        .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
+    if payer == trader_authority {
+        return Err(VulcanError::validation(
+            "FEE_PAYER_IS_TRADER",
+            "Fee payer wallet is the same as the trader wallet; omit --fee-payer.",
+        ));
+    }
+    let password = if wallet_file.is_local_encrypted() {
+        Some(crate::commands::trade::prompt_password()?)
+    } else {
+        None
+    };
+    ResolvedSigner::from_wallet_file(&wallet_file, password.as_deref()).await
+}
+
+/// The SDK's RegisterTrader builder lists the trader as a readonly non-signer.
+/// When someone else pays, the trader must co-sign to authorize the registration.
+fn mark_trader_as_signer(ix: &mut solana_sdk::instruction::Instruction, trader: &Pubkey) {
+    for meta in ix.accounts.iter_mut() {
+        if meta.pubkey == *trader {
+            meta.is_signer = true;
+        }
+    }
 }
 
 /// The onboard instruction lists the API's trader onboarder as a required
@@ -615,10 +699,19 @@ async fn submit_referral_activation_tx(
     authority: Pubkey,
     referral_code: String,
     status: ReferralActivationTraderStatus,
+    fee_payer: Option<&str>,
 ) -> Result<Option<String>, VulcanError> {
     let trader = TraderKey::new(authority);
     let (wallet, _, _) =
         crate::commands::trade::resolve_wallet_and_pda(ctx, Some(wallet_name)).await?;
+    let fee_payer_wallet = match fee_payer {
+        Some(name) => Some(resolve_fee_payer_signer(ctx, name, authority).await?),
+        None => None,
+    };
+    let payer = fee_payer_wallet
+        .as_ref()
+        .map(|w| w.authority)
+        .unwrap_or(authority);
     let permission_response = ctx
         .http_client
         .invite()
@@ -643,10 +736,10 @@ async fn submit_referral_activation_tx(
 
     let mut ixs = Vec::<solana_sdk::instruction::Instruction>::new();
     if status.should_include_register_trader() {
-        ensure_sol_for_cross_trader_rent(ctx, authority, CROSS_MARGIN_MAX_POSITIONS).await?;
+        ensure_sol_for_cross_trader_rent(ctx, payer, CROSS_MARGIN_MAX_POSITIONS).await?;
 
         let register_params = RegisterTraderParams::builder()
-            .payer(authority)
+            .payer(payer)
             .trader(authority)
             .trader_account(trader.pda())
             .max_positions(CROSS_MARGIN_MAX_POSITIONS as u64)
@@ -654,11 +747,16 @@ async fn submit_referral_activation_tx(
             .subaccount_index(0)
             .build()
             .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?;
-        ixs.push(
+        let mut register_ix: solana_sdk::instruction::Instruction =
             create_register_trader_ix(register_params)
                 .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
-                .into(),
-        );
+                .into();
+        if payer != authority {
+            // Sponsored registration: the payer covers fee and rent, but the trader
+            // authority must still sign to authorize its own registration.
+            mark_trader_as_signer(&mut register_ix, &authority);
+        }
+        ixs.push(register_ix);
     }
 
     let onboard_params = OnboardTraderDelegatedParams::builder()
@@ -675,8 +773,14 @@ async fn submit_referral_activation_tx(
             .into(),
     );
 
-    let (transaction, recent_blockhash, _) =
-        sign_onboarding_transaction_for_api(ctx, &wallet, ixs, trader_onboarder).await?;
+    let (transaction, recent_blockhash, _) = sign_onboarding_transaction_for_api(
+        ctx,
+        &wallet,
+        fee_payer_wallet.as_ref(),
+        ixs,
+        trader_onboarder,
+    )
+    .await?;
     let response = ctx
         .http_client
         .invite()
@@ -699,6 +803,7 @@ async fn register_authority(
     wallet_name: &str,
     authority: Pubkey,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     let status = trader_onboarding_status(ctx, &authority).await?;
 
@@ -712,7 +817,7 @@ async fn register_authority(
             .map(|code| code.trim().to_string())
             .filter(|code| !code.is_empty())
             .unwrap_or_else(|| DEFAULT_REFERRAL_CODE.to_string());
-        submit_referral_activation_tx(ctx, wallet_name, authority, code, status).await?
+        submit_referral_activation_tx(ctx, wallet_name, authority, code, status, fee_payer).await?
     };
 
     let trader_key = TraderKey::new(authority);
