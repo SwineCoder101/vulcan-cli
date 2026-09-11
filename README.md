@@ -134,7 +134,7 @@ vulcan trade SOL long --notional-usdc 100 -y # fee paid by sponsor
 vulcan wallet clear-fee-payer                # back to the trader wallet paying
 ```
 
-`--fee-payer <name>` overrides the linked paymaster for a single command.
+`--fee-payer <name>` overrides the linked paymaster for a single command. Over MCP, use `vulcan_wallet_set_fee_payer` / `vulcan_wallet_clear_fee_payer`; the link applies to the next transaction without restarting the server.
 
 ### Inspecting and repairing
 

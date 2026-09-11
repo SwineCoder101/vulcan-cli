@@ -589,7 +589,7 @@ pub static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "vulcan_wallet_list",
-        description: "List all stored wallets with names, public keys, and default status.",
+        description: "List all stored wallets with names, public keys, and default status. Includes fee_payer (the linked paymaster wallet name) when one is set.",
         group: "wallet",
         dangerous: false,
         schema: || json!({
@@ -631,6 +631,37 @@ pub static TOOLS: &[ToolDef] = &[
         }),
         command: "vulcan wallet balance",
         example: "vulcan wallet balance -o json",
+        auth_required: false,
+    },
+    ToolDef {
+        name: "vulcan_wallet_set_fee_payer",
+        description: "Link a stored wallet as the paymaster: it pays Solana transaction fees and registration rent for every subsequent transaction (register, deposit, withdraw, trades, closes, cancels) while the trader wallet still signs. The paymaster gains no authority over funds or positions; fund it with SOL. Takes effect on the next transaction in this session.",
+        group: "wallet",
+        dangerous: false,
+        schema: || json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Stored wallet name to use as paymaster" }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+        command: "vulcan wallet set-fee-payer",
+        example: "vulcan wallet set-fee-payer sponsor -o json",
+        auth_required: false,
+    },
+    ToolDef {
+        name: "vulcan_wallet_clear_fee_payer",
+        description: "Unlink the paymaster so the trader wallet pays its own transaction fees again.",
+        group: "wallet",
+        dangerous: false,
+        schema: || json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        command: "vulcan wallet clear-fee-payer",
+        example: "vulcan wallet clear-fee-payer -o json",
         auth_required: false,
     },
 

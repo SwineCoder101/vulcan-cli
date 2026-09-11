@@ -596,82 +596,6 @@ async fn sign_fully(
     Ok(())
 }
 
-#[cfg(test)]
-mod fee_payer_signing_tests {
-    use super::*;
-    use solana_sdk::signature::{Keypair, Signer as _};
-
-    fn trader_ix(trader: Pubkey) -> solana_sdk::instruction::Instruction {
-        solana_sdk::instruction::Instruction {
-            program_id: Pubkey::new_unique(),
-            accounts: vec![solana_sdk::instruction::AccountMeta::new(trader, true)],
-            data: vec![],
-        }
-    }
-
-    fn dyn_signer(kp: &Keypair) -> solana_keychain::MemorySigner {
-        solana_keychain::MemorySigner::from_bytes(&kp.to_bytes()).unwrap()
-    }
-
-    #[tokio::test]
-    async fn paymaster_pays_and_both_signatures_verify() {
-        let trader_kp = Keypair::new();
-        let sponsor_kp = Keypair::new();
-        let (trader, sponsor) = (trader_kp.pubkey(), sponsor_kp.pubkey());
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader)],
-            Some(&sponsor),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
-        assert_eq!(
-            tx.message.account_keys[0], sponsor,
-            "paymaster is the fee payer"
-        );
-        assert_eq!(tx.message.header.num_required_signatures, 2);
-
-        sign_fully(
-            &mut tx,
-            &dyn_signer(&trader_kp),
-            Some(&dyn_signer(&sponsor_kp)),
-        )
-        .await
-        .expect("fully signed");
-        assert!(tx.verify_with_results().iter().all(|ok| *ok));
-    }
-
-    #[tokio::test]
-    async fn missing_paymaster_signature_is_rejected() {
-        let trader_kp = Keypair::new();
-        let sponsor = Keypair::new().pubkey();
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader_kp.pubkey())],
-            Some(&sponsor),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
-
-        let err = sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
-            .await
-            .expect_err("sponsor slot left empty");
-        assert_eq!(err.code, "PARTIAL_SIGNATURE");
-    }
-
-    #[tokio::test]
-    async fn trader_alone_pays_without_paymaster() {
-        let trader_kp = Keypair::new();
-        let trader = trader_kp.pubkey();
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader)],
-            Some(&trader),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
-
-        sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
-            .await
-            .expect("single signer suffices");
-        assert!(tx.verify_with_results().iter().all(|ok| *ok));
-    }
-}
-
 /// Build a conditional-orders account init instruction when the PDA is missing
 /// or exists as the zero-sized system account left behind by some isolated
 /// subaccount flows.
@@ -2760,5 +2684,161 @@ mod conditional_cancel_id_tests {
         assert!(
             parse_conditional_order_id("ctp-10-1-unknown", TriggerKind::TakeProfit, 10).is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod fee_payer_signing_tests {
+    use super::*;
+    use solana_sdk::signature::{Keypair, Signer as _};
+
+    /// Every transaction Vulcan submits must go through a paymaster-aware
+    /// path. There are exactly two: `send_or_dry_run_with_cu_limit` here (all
+    /// trade, margin, position, and subaccount actions) and the onboarding
+    /// signer in `account.rs` (registration via the Phoenix API). If a new
+    /// command builds and submits its own transaction, this test fails so the
+    /// author routes it through the helper and the paymaster keeps covering
+    /// every action.
+    /// Source before the first `#[cfg(test)]`; test modules live at file ends.
+    fn production_only(src: &str) -> String {
+        src.split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn every_transaction_path_is_paymaster_aware() {
+        let commands_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let submit_markers = [
+            "send_and_confirm_transaction(",
+            "send_transaction(",
+            ".sign_transaction(",
+            "new_with_payer(",
+        ];
+        let allowed: std::collections::BTreeMap<&str, &[&str]> = [
+            (
+                "trade.rs",
+                &["send_or_dry_run_with_cu_limit", "sign_fully"][..],
+            ),
+            ("account.rs", &["sign_onboarding_transaction_for_api"][..]),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut offenders = Vec::new();
+        let mut tx_modules = Vec::new();
+        for entry in std::fs::read_dir(&commands_dir).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = production_only(&std::fs::read_to_string(&path).unwrap());
+            let submits = submit_markers.iter().any(|m| src.contains(m));
+            if submits && !allowed.contains_key(name.as_str()) {
+                offenders.push(name.clone());
+            }
+            if src.contains("send_or_dry_run") {
+                tx_modules.push(name.clone());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these command modules submit or sign transactions outside the paymaster-aware helpers: {offenders:?}. Route them through `send_or_dry_run` so `--fee-payer` / `wallet set-fee-payer` covers them."
+        );
+
+        // The modules that host transaction actions must all use the helper.
+        tx_modules.sort();
+        for required in ["account.rs", "margin.rs", "position.rs", "trade.rs"] {
+            assert!(
+                tx_modules.contains(&required.to_string()),
+                "{required} no longer calls send_or_dry_run; paymaster coverage for its actions is unverified"
+            );
+        }
+
+        // Inside the allowed modules, the payer is chosen from the sponsor.
+        let trade_src =
+            production_only(&std::fs::read_to_string(commands_dir.join("trade.rs")).unwrap());
+        assert_eq!(
+            trade_src.matches("new_with_payer(").count(),
+            1,
+            "trade.rs must build the live transaction in exactly one place"
+        );
+        let account_src = std::fs::read_to_string(commands_dir.join("account.rs")).unwrap();
+        assert!(
+            account_src.contains("fee_payer_wallet: Option<&ResolvedSigner>"),
+            "registration signing must accept the sponsor signer"
+        );
+    }
+
+    fn trader_ix(trader: Pubkey) -> solana_sdk::instruction::Instruction {
+        solana_sdk::instruction::Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![solana_sdk::instruction::AccountMeta::new(trader, true)],
+            data: vec![],
+        }
+    }
+
+    fn dyn_signer(kp: &Keypair) -> solana_keychain::MemorySigner {
+        solana_keychain::MemorySigner::from_bytes(&kp.to_bytes()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn paymaster_pays_and_both_signatures_verify() {
+        let trader_kp = Keypair::new();
+        let sponsor_kp = Keypair::new();
+        let (trader, sponsor) = (trader_kp.pubkey(), sponsor_kp.pubkey());
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader)],
+            Some(&sponsor),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        assert_eq!(
+            tx.message.account_keys[0], sponsor,
+            "paymaster is the fee payer"
+        );
+        assert_eq!(tx.message.header.num_required_signatures, 2);
+
+        sign_fully(
+            &mut tx,
+            &dyn_signer(&trader_kp),
+            Some(&dyn_signer(&sponsor_kp)),
+        )
+        .await
+        .expect("fully signed");
+        assert!(tx.verify_with_results().iter().all(|ok| *ok));
+    }
+
+    #[tokio::test]
+    async fn missing_paymaster_signature_is_rejected() {
+        let trader_kp = Keypair::new();
+        let sponsor = Keypair::new().pubkey();
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader_kp.pubkey())],
+            Some(&sponsor),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+
+        let err = sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
+            .await
+            .expect_err("sponsor slot left empty");
+        assert_eq!(err.code, "PARTIAL_SIGNATURE");
+    }
+
+    #[tokio::test]
+    async fn trader_alone_pays_without_paymaster() {
+        let trader_kp = Keypair::new();
+        let trader = trader_kp.pubkey();
+        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
+            &[trader_ix(trader)],
+            Some(&trader),
+        );
+        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+
+        sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
+            .await
+            .expect("single signer suffices");
+        assert!(tx.verify_with_results().iter().all(|ok| *ok));
     }
 }

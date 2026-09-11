@@ -362,33 +362,13 @@ pub async fn execute(ctx: &AppContext, cmd: WalletCommand) -> Result<(), VulcanE
         }
 
         WalletCommand::SetFeePayer { name } => {
-            let previous = ctx.wallet_store.fee_payer().ok().flatten();
-            let wallet_file = ctx
-                .wallet_store
-                .load(&name)
-                .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
-            ctx.wallet_store
-                .set_fee_payer(&name)
-                .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
-
-            let result = FeePayerSet {
-                name,
-                public_key: wallet_file.public_key,
-                previous,
-            };
+            let result = execute_set_fee_payer_inner(ctx, &name)?;
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
         }
 
         WalletCommand::ClearFeePayer => {
-            let previous = ctx.wallet_store.clear_fee_payer().map_err(|e| {
-                VulcanError::new(
-                    crate::error::ErrorCategory::Io,
-                    "FEE_PAYER_CLEAR_FAILED",
-                    e.to_string(),
-                )
-            })?;
-            let result = FeePayerCleared { previous };
+            let result = execute_clear_fee_payer_inner(ctx)?;
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
         }
@@ -755,6 +735,40 @@ fn env_or_default(value: Option<String>, default: &str) -> String {
 }
 
 // ── Inner functions for MCP ────────────────────────────────────────────
+
+/// Link a stored wallet as the paymaster (CLI `wallet set-fee-payer`, MCP
+/// `vulcan_wallet_set_fee_payer`). Takes effect on the next transaction.
+pub fn execute_set_fee_payer_inner(
+    ctx: &AppContext,
+    name: &str,
+) -> Result<FeePayerSet, VulcanError> {
+    let name = name.trim();
+    let previous = ctx.wallet_store.fee_payer().ok().flatten();
+    let wallet_file = ctx
+        .wallet_store
+        .load(name)
+        .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
+    ctx.wallet_store
+        .set_fee_payer(name)
+        .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
+    Ok(FeePayerSet {
+        name: name.to_string(),
+        public_key: wallet_file.public_key,
+        previous,
+    })
+}
+
+/// Unlink the paymaster (CLI `wallet clear-fee-payer`, MCP `vulcan_wallet_clear_fee_payer`).
+pub fn execute_clear_fee_payer_inner(ctx: &AppContext) -> Result<FeePayerCleared, VulcanError> {
+    let previous = ctx.wallet_store.clear_fee_payer().map_err(|e| {
+        VulcanError::new(
+            crate::error::ErrorCategory::Io,
+            "FEE_PAYER_CLEAR_FAILED",
+            e.to_string(),
+        )
+    })?;
+    Ok(FeePayerCleared { previous })
+}
 
 pub fn execute_list_inner(ctx: &AppContext) -> Result<WalletList, VulcanError> {
     let names = ctx.wallet_store.list().map_err(|e| {

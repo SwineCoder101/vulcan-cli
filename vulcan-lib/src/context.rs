@@ -56,9 +56,11 @@ pub struct AppContext {
     /// Global CLI `--wallet` name: use this stored wallet instead of the default when set.
     /// Ignored when `session_wallet` is present (MCP). Not used by `vulcan mcp` (pass `None`).
     pub wallet_override: Option<String>,
-    /// Stored wallet name that pays transaction fees (and registration rent)
-    /// instead of the trader wallet. From the global `--fee-payer` flag, else
-    /// the linked paymaster set with `vulcan wallet set-fee-payer`.
+    /// Global `--fee-payer` override: stored wallet name that pays transaction
+    /// fees (and registration rent) instead of the trader wallet for this run.
+    /// When `None`, the paymaster linked with `vulcan wallet set-fee-payer` is
+    /// read live from the wallet store at each transaction, so MCP sessions see
+    /// link changes immediately.
     pub fee_payer: Option<String>,
     /// Lazily-initialized metadata (fetched on first use).
     metadata: OnceCell<PhoenixMetadata>,
@@ -120,8 +122,7 @@ impl AppContext {
         let wallet_store = WalletStore::new(&vulcan_dir)?;
         let fee_payer = fee_payer_override
             .filter(|w| !w.trim().is_empty())
-            .map(|w| w.trim().to_string())
-            .or(wallet_store.fee_payer()?);
+            .map(|w| w.trim().to_string());
         let session_id = new_session_id();
         let agent_log = if config.agent_log.enabled {
             let path = config

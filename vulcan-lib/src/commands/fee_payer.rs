@@ -7,7 +7,7 @@
 
 use crate::context::AppContext;
 use crate::error::VulcanError;
-use crate::wallet::{ResolvedSigner, WalletFile};
+use crate::wallet::{ResolvedSigner, WalletFile, WalletStore};
 use solana_pubkey::Pubkey;
 use std::str::FromStr;
 
@@ -77,23 +77,47 @@ impl FeePayerWallet {
 
 /// Resolve the fee payer for a transaction signed by `trader_authority`.
 ///
-/// Precedence: explicit per-call name > global `--fee-payer` / linked paymaster
-/// (`ctx.fee_payer`) > none (the trader wallet pays its own fees). A sponsor equal
-/// to the trader also yields `None`, so one linked paymaster can serve several
-/// trader wallets and be selected as a trader itself without special-casing.
+/// Precedence, highest first:
+/// 1. explicit per-call name
+/// 2. global `--fee-payer` (`ctx.fee_payer`)
+/// 3. paymaster linked in the wallet store (`vulcan wallet set-fee-payer`),
+///    read live so MCP link changes apply at once
+/// 4. none: the trader pays its own fees
+///
+/// A sponsor equal to the trader also yields `None`, so one linked paymaster
+/// can serve several trader wallets and be selected as a trader itself.
 pub fn resolve_fee_payer(
     ctx: &AppContext,
     explicit: Option<&str>,
     trader_authority: Pubkey,
 ) -> Result<Option<FeePayerWallet>, VulcanError> {
-    let name = explicit
-        .map(str::trim)
-        .filter(|n| !n.is_empty())
-        .or(ctx.fee_payer.as_deref());
+    let name = resolve_fee_payer_name(&ctx.wallet_store, ctx.fee_payer.as_deref(), explicit)?;
     match name {
-        Some(n) => FeePayerWallet::load(ctx, n, trader_authority),
+        Some(n) => FeePayerWallet::load(ctx, &n, trader_authority),
         None => Ok(None),
     }
+}
+
+/// Pick which wallet name (if any) should pay, without loading it.
+pub fn resolve_fee_payer_name(
+    store: &WalletStore,
+    flag_override: Option<&str>,
+    explicit: Option<&str>,
+) -> Result<Option<String>, VulcanError> {
+    let clean = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+    };
+    if let Some(n) = clean(explicit) {
+        return Ok(Some(n));
+    }
+    if let Some(n) = clean(flag_override) {
+        return Ok(Some(n));
+    }
+    store
+        .fee_payer()
+        .map_err(|e| VulcanError::io("FEE_PAYER_LINK_READ_FAILED", e.to_string()))
 }
 
 pub(crate) const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
@@ -149,6 +173,96 @@ pub(crate) fn ensure_sol_for_fee(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wallet::WalletSignerConfig;
+
+    fn store_with(names: &[&str]) -> (tempfile::TempDir, WalletStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = WalletStore::new(dir.path()).unwrap();
+        for name in names {
+            let file = WalletFile::remote(
+                name.to_string(),
+                Pubkey::new_unique().to_string(),
+                WalletSignerConfig::Vault {
+                    vault_addr: "https://vault.example".into(),
+                    token_env: "VAULT_TOKEN".into(),
+                    key_name: name.to_string(),
+                },
+                "now".into(),
+            );
+            store.save(&file).unwrap();
+        }
+        (dir, store)
+    }
+
+    #[test]
+    fn resolver_prefers_explicit_then_flag_then_linked_store() {
+        let (_dir, store) = store_with(&["linked", "flagged", "explicit"]);
+        assert_eq!(resolve_fee_payer_name(&store, None, None).unwrap(), None);
+
+        store.set_fee_payer("linked").unwrap();
+        assert_eq!(
+            resolve_fee_payer_name(&store, None, None)
+                .unwrap()
+                .as_deref(),
+            Some("linked"),
+            "linked paymaster applies with no flags"
+        );
+        assert_eq!(
+            resolve_fee_payer_name(&store, Some("flagged"), None)
+                .unwrap()
+                .as_deref(),
+            Some("flagged"),
+            "--fee-payer overrides the link"
+        );
+        assert_eq!(
+            resolve_fee_payer_name(&store, Some("flagged"), Some(" explicit "))
+                .unwrap()
+                .as_deref(),
+            Some("explicit"),
+            "a per-call name wins and is trimmed"
+        );
+        assert_eq!(
+            resolve_fee_payer_name(&store, Some("  "), None)
+                .unwrap()
+                .as_deref(),
+            Some("linked"),
+            "a blank flag is ignored"
+        );
+
+        store.clear_fee_payer().unwrap();
+        assert_eq!(resolve_fee_payer_name(&store, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn resolver_reads_the_link_live_between_calls() {
+        // MCP keeps one context for the whole session; a link set mid-session
+        // must be honored by the next transaction without a restart.
+        let (_dir, store) = store_with(&["sponsor"]);
+        assert_eq!(resolve_fee_payer_name(&store, None, None).unwrap(), None);
+        store.set_fee_payer("sponsor").unwrap();
+        assert_eq!(
+            resolve_fee_payer_name(&store, None, None)
+                .unwrap()
+                .as_deref(),
+            Some("sponsor")
+        );
+    }
+
+    #[test]
+    fn linking_an_unknown_wallet_is_rejected_and_dangling_links_are_ignored() {
+        let (dir, store) = store_with(&["sponsor"]);
+        let dir = std::mem::ManuallyDrop::new(dir);
+        assert!(store.set_fee_payer("nope").is_err());
+        store.set_fee_payer("sponsor").unwrap();
+        // Simulate the sponsor wallet being removed after linking.
+        std::fs::remove_file(store.wallet_path("sponsor")).unwrap();
+        let _keep = &dir;
+        assert_eq!(
+            resolve_fee_payer_name(&store, None, None).unwrap(),
+            None,
+            "a link to a missing wallet must not become a broken fee payer"
+        );
+    }
 
     #[test]
     fn fee_check_rejects_underfunded_paymaster_with_amounts_in_message() {

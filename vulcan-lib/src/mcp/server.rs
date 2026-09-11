@@ -428,6 +428,15 @@ impl VulcanMcpServer {
                 let result = commands::wallet::execute_balance_inner(&self.ctx, name.as_deref())?;
                 Ok(serde_json::to_value(result).unwrap())
             }
+            "vulcan_wallet_set_fee_payer" => {
+                let name = arg_str(args, "name")?;
+                let result = commands::wallet::execute_set_fee_payer_inner(&self.ctx, &name)?;
+                Ok(serde_json::to_value(result).unwrap())
+            }
+            "vulcan_wallet_clear_fee_payer" => {
+                let result = commands::wallet::execute_clear_fee_payer_inner(&self.ctx)?;
+                Ok(serde_json::to_value(result).unwrap())
+            }
 
             // ── Portfolio ─────────────────────────────────────────────────
             "vulcan_portfolio" => {

@@ -459,3 +459,163 @@ fn register_offline_with_global(fake_home: &Path, global_args: &[&str]) -> serde
     args.extend_from_slice(&["account", "register"]);
     run_json(fake_home, &args)
 }
+
+/// Drive the MCP server over stdio, sending each request only after the
+/// previous one was answered (the server handles calls concurrently, so a
+/// batch would race). Returns the responses keyed by request id.
+fn mcp_session(
+    fake_home: &Path,
+    extra_env: &[(&str, &str)],
+    requests: &[String],
+) -> std::collections::HashMap<i64, serde_json::Value> {
+    use std::io::BufRead;
+
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.args(["mcp", "--allow-dangerous"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn vulcan mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut send = |line: &str| {
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut responses = std::collections::HashMap::new();
+    let await_id = |id: i64, responses: &mut std::collections::HashMap<i64, serde_json::Value>| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let v = rx
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("no MCP response for id {id} within 20s"));
+            if let Some(got) = v.get("id").and_then(|i| i.as_i64()) {
+                responses.insert(got, v);
+                if got == id {
+                    return;
+                }
+            }
+        }
+    };
+
+    send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+    );
+    await_id(1, &mut responses);
+    send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    for req in requests {
+        let id = serde_json::from_str::<serde_json::Value>(req)
+            .ok()
+            .and_then(|v| v["id"].as_i64())
+            .expect("request has an id");
+        send(req);
+        await_id(id, &mut responses);
+    }
+    drop(stdin);
+    let _ = child.wait();
+    responses
+}
+
+/// The JSON a tool returned: `result.content[0].text` parsed as JSON.
+fn tool_json(v: &serde_json::Value) -> serde_json::Value {
+    let text = v["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool call had no text content: {v}"));
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("tool text is not JSON: {text}"))
+}
+
+#[test]
+fn mcp_can_link_and_clear_the_paymaster_mid_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    create_local_wallet(tmp.path(), "sponsor");
+
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vulcan_wallet_set_fee_payer","arguments":{"name":"sponsor"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"vulcan_wallet_list","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"vulcan_wallet_clear_fee_payer","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"vulcan_wallet_list","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"vulcan_wallet_set_fee_payer","arguments":{"name":"no-such-wallet"}}}"#.to_string(),
+    ];
+    let responses = mcp_session(
+        tmp.path(),
+        &[
+            ("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD),
+            ("VULCAN_WALLET_NAME", "mcp-test"),
+        ],
+        &requests,
+    );
+
+    let tools: Vec<String> = responses[&2]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    for name in [
+        "vulcan_wallet_set_fee_payer",
+        "vulcan_wallet_clear_fee_payer",
+    ] {
+        assert!(
+            tools.iter().any(|t| t == name),
+            "{name} missing from tools/list: {tools:?}"
+        );
+    }
+
+    let set = tool_json(&responses[&3]);
+    assert_eq!(set["name"], "sponsor", "set result: {set}");
+    assert!(set["public_key"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false));
+
+    let list = tool_json(&responses[&4]);
+    assert_eq!(
+        list["fee_payer"], "sponsor",
+        "link must be visible in the same session: {list}"
+    );
+
+    let cleared = tool_json(&responses[&5]);
+    assert_eq!(cleared["previous"], "sponsor", "clear result: {cleared}");
+
+    let list = tool_json(&responses[&6]);
+    assert!(
+        list["fee_payer"].is_null(),
+        "link must be gone after clear: {list}"
+    );
+
+    let bad = &responses[&7];
+    let is_error = bad["result"]["isError"].as_bool().unwrap_or(false);
+    let text = bad["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        is_error || text.contains("WALLET_NOT_FOUND"),
+        "linking an unknown wallet must fail: {bad}"
+    );
+
+    // The link file itself is what the send path reads live, so it must be gone on disk too.
+    assert!(!tmp.path().join(".vulcan/wallets/fee_payer").exists());
+}
