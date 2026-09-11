@@ -1,6 +1,7 @@
 //! Paymaster: a stored wallet that pays transaction fees and registration rent
 //! instead of the trader wallet. It co-signs as fee payer; the trader still signs.
 
+use crate::commands::account::format_sol_lamports;
 use crate::commands::trade::prompt_password;
 use crate::context::AppContext;
 use crate::error::VulcanError;
@@ -96,21 +97,6 @@ pub fn resolve_fee_payer_name(
     store
         .fee_payer()
         .map_err(|e| VulcanError::io("FEE_PAYER_LINK_READ_FAILED", e.to_string()))
-}
-
-pub(crate) const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
-
-pub(crate) fn format_sol_lamports(lamports: u64) -> String {
-    let whole = lamports / LAMPORTS_PER_SOL;
-    let fractional = lamports % LAMPORTS_PER_SOL;
-    let mut value = format!("{whole}.{fractional:09}");
-    while value.contains('.') && value.ends_with('0') {
-        value.pop();
-    }
-    if value.ends_with('.') {
-        value.push('0');
-    }
-    value
 }
 
 pub(crate) fn check_fee_balance(
