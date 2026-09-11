@@ -1,7 +1,7 @@
 {
   "schema_version": "1.0.0",
   "cli_version": "0.6.4",
-  "description": "Machine-readable command catalog for vulcan. 66 tools across 13 groups.",
+  "description": "Machine-readable command catalog for vulcan. 68 tools across 13 groups.",
   "groups": {
     "market": "Market data: prices, orderbooks, candles, funding rates",
     "trade": "Order management: place, cancel, TP/SL",
@@ -771,7 +771,7 @@
       "name": "vulcan_wallet_list",
       "command": "vulcan wallet list",
       "group": "wallet",
-      "description": "List all stored wallets with names, public keys, and default status.",
+      "description": "List all stored wallets with names, public keys, and default status. Includes fee_payer (the linked paymaster wallet name) when one is set.",
       "auth_required": false,
       "dangerous": false,
       "parameters": [],
@@ -810,6 +810,33 @@
         }
       ],
       "example": "vulcan wallet balance -o json"
+    },
+    {
+      "name": "vulcan_wallet_set_fee_payer",
+      "command": "vulcan wallet set-fee-payer",
+      "group": "wallet",
+      "description": "Link a stored wallet as the paymaster: it pays Solana transaction fees and registration rent for every subsequent transaction (register, deposit, withdraw, trades, closes, cancels) while the trader wallet still signs. The paymaster gains no authority over funds or positions; fund it with SOL. Takes effect on the next transaction in this session.",
+      "auth_required": false,
+      "dangerous": false,
+      "parameters": [
+        {
+          "name": "name",
+          "type": "string",
+          "required": true,
+          "description": "Stored wallet name to use as paymaster"
+        }
+      ],
+      "example": "vulcan wallet set-fee-payer sponsor -o json"
+    },
+    {
+      "name": "vulcan_wallet_clear_fee_payer",
+      "command": "vulcan wallet clear-fee-payer",
+      "group": "wallet",
+      "description": "Unlink the paymaster so the trader wallet pays its own transaction fees again.",
+      "auth_required": false,
+      "dangerous": false,
+      "parameters": [],
+      "example": "vulcan wallet clear-fee-payer -o json"
     },
     {
       "name": "vulcan_portfolio",
@@ -1121,7 +1148,7 @@
       "name": "vulcan_account_register",
       "command": "vulcan account register",
       "group": "account",
-      "description": "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code.",
+      "description": "Register and onboard a trader account via /v1/referral/activate-tx. Omit referral_code to register with the default code. Pass fee_payer (a stored wallet name) to have that wallet pay the fee and rent instead of the trader wallet.",
       "auth_required": true,
       "dangerous": true,
       "parameters": [
@@ -1130,6 +1157,12 @@
           "type": "string",
           "required": false,
           "description": "Referral code (optional; the default code is used when omitted)"
+        },
+        {
+          "name": "fee_payer",
+          "type": "string",
+          "required": false,
+          "description": "Stored wallet name that pays the transaction fee and trader-account rent (optional; sponsored registration, both wallets sign)"
         },
         {
           "name": "acknowledged",

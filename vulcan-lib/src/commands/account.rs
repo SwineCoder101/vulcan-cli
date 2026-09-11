@@ -1,6 +1,7 @@
 //! Account command execution.
 
 use crate::cli::account::AccountCommand;
+use crate::commands::fee_payer::{resolve_fee_payer, FeePayerWallet};
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
@@ -19,6 +20,7 @@ use serde::Serialize;
 use solana_keychain::SignTransactionResult;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_sdk::instruction::Instruction;
 use std::str::FromStr;
 
 const CROSS_MARGIN_MAX_POSITIONS: u32 = 128;
@@ -38,6 +40,9 @@ pub struct RegisterResult {
     pub trader_pda: String,
     pub dry_run: bool,
     pub tx_signature: Option<String>,
+    /// Sponsor wallet pubkey when `--fee-payer` was given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fee_payer: Option<String>,
 }
 
 pub(crate) async fn trader_onboarding_status(
@@ -71,7 +76,7 @@ fn trader_account_size(max_positions: u32) -> Result<usize, VulcanError> {
         })
 }
 
-fn format_sol_lamports(lamports: u64) -> String {
+pub(crate) fn format_sol_lamports(lamports: u64) -> String {
     let whole = lamports / LAMPORTS_PER_SOL;
     let fractional = lamports % LAMPORTS_PER_SOL;
     let mut value = format!("{whole}.{fractional:09}");
@@ -172,6 +177,9 @@ impl TableRenderable for RegisterResult {
         }
         println!("  Authority: {}", self.authority);
         println!("  Trader PDA: {}", self.trader_pda);
+        if let Some(fee_payer) = &self.fee_payer {
+            println!("  Fee payer: {}", fee_payer);
+        }
         if let Some(sig) = &self.tx_signature {
             println!("  Tx: {}", sig);
         }
@@ -266,7 +274,8 @@ pub async fn execute(ctx: &AppContext, cmd: AccountCommand) -> Result<(), Vulcan
     match cmd {
         AccountCommand::Register { referral_code } => {
             let (wallet_name, authority) = resolve_authority(ctx)?;
-            let result = register_authority(ctx, &wallet_name, authority, referral_code).await?;
+            let result =
+                register_authority(ctx, &wallet_name, authority, referral_code, None).await?;
 
             render_success(ctx.output_format, &result, serde_json::Value::Null);
             Ok(())
@@ -400,6 +409,7 @@ pub async fn execute(ctx: &AppContext, cmd: AccountCommand) -> Result<(), Vulcan
                 trader_pda: trader_key.pda().to_string(),
                 dry_run: ctx.dry_run,
                 tx_signature: sig,
+                fee_payer: None,
             };
 
             render_success(ctx.output_format, &result, serde_json::Value::Null);
@@ -445,15 +455,17 @@ pub async fn execute_info_inner(ctx: &AppContext) -> Result<AccountInfoResult, V
 pub async fn execute_register_inner(
     ctx: &AppContext,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     let (wallet_name, authority) = resolve_authority(ctx)?;
-    register_authority(ctx, &wallet_name, authority, referral_code).await
+    register_authority(ctx, &wallet_name, authority, referral_code, fee_payer).await
 }
 
 pub async fn execute_register_wallet_inner(
     ctx: &AppContext,
     wallet_name: &str,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
     let wallet_file = ctx
         .wallet_store
@@ -461,17 +473,18 @@ pub async fn execute_register_wallet_inner(
         .map_err(|e| VulcanError::auth("WALLET_NOT_FOUND", e.to_string()))?;
     let authority = Pubkey::from_str(&wallet_file.public_key)
         .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
-    register_authority(ctx, wallet_name, authority, referral_code).await
+    register_authority(ctx, wallet_name, authority, referral_code, fee_payer).await
 }
 
 async fn sign_onboarding_transaction_for_api(
     ctx: &AppContext,
     wallet: &ResolvedSigner,
+    fee_payer_wallet: Option<&ResolvedSigner>,
     ixs: Vec<solana_sdk::instruction::Instruction>,
     trader_onboarder: Pubkey,
 ) -> Result<(String, String, Pubkey), VulcanError> {
     let signer = wallet.signer()?;
-    let fee_payer = signer.pubkey();
+    let mut fee_payer = signer.pubkey();
     if fee_payer != wallet.authority {
         return Err(VulcanError::auth(
             "SIGNER_PUBKEY_MISMATCH",
@@ -480,6 +493,13 @@ async fn sign_onboarding_transaction_for_api(
                 fee_payer, wallet.authority
             ),
         ));
+    }
+    let payer_signer = match fee_payer_wallet {
+        Some(w) => Some(w.signer()?),
+        None => None,
+    };
+    if let Some(payer_signer) = payer_signer {
+        fee_payer = payer_signer.pubkey();
     }
 
     simulate_onboarding_transaction(ctx, &ixs, fee_payer).await?;
@@ -491,16 +511,31 @@ async fn sign_onboarding_transaction_for_api(
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
 
-    let signed = signer
+    let mut signed = signer
         .sign_transaction(&mut tx)
         .await
         .map_err(|e| VulcanError::auth("TX_SIGN_FAILED", e.to_string()))?;
+    if let Some(payer_signer) = payer_signer {
+        signed = payer_signer
+            .sign_transaction(&mut tx)
+            .await
+            .map_err(|e| VulcanError::auth("FEE_PAYER_TX_SIGN_FAILED", e.to_string()))?;
+    }
     if matches!(signed, SignTransactionResult::Partial(_)) {
         validate_partial_onboarding_signatures(&tx, &trader_onboarder)?;
     }
 
     let (transaction, _) = signed.into_signed_transaction();
     Ok((transaction, recent_blockhash.to_string(), fee_payer))
+}
+
+/// The SDK builder lists the trader as a non-signer; a sponsored registration needs its signature.
+fn mark_trader_as_signer(ix: &mut Instruction, trader: &Pubkey) {
+    for meta in ix.accounts.iter_mut() {
+        if meta.pubkey == *trader {
+            meta.is_signer = true;
+        }
+    }
 }
 
 /// The onboard instruction lists the API's trader onboarder as a required
@@ -615,10 +650,19 @@ async fn submit_referral_activation_tx(
     authority: Pubkey,
     referral_code: String,
     status: ReferralActivationTraderStatus,
+    fee_payer: Option<&FeePayerWallet>,
 ) -> Result<Option<String>, VulcanError> {
     let trader = TraderKey::new(authority);
     let (wallet, _, _) =
         crate::commands::trade::resolve_wallet_and_pda(ctx, Some(wallet_name)).await?;
+    let fee_payer_wallet = match fee_payer {
+        Some(sponsor) => Some(sponsor.signer().await?),
+        None => None,
+    };
+    let payer = fee_payer_wallet
+        .as_ref()
+        .map(|w| w.authority)
+        .unwrap_or(authority);
     let permission_response = ctx
         .http_client
         .invite()
@@ -643,10 +687,10 @@ async fn submit_referral_activation_tx(
 
     let mut ixs = Vec::<solana_sdk::instruction::Instruction>::new();
     if status.should_include_register_trader() {
-        ensure_sol_for_cross_trader_rent(ctx, authority, CROSS_MARGIN_MAX_POSITIONS).await?;
+        ensure_sol_for_cross_trader_rent(ctx, payer, CROSS_MARGIN_MAX_POSITIONS).await?;
 
         let register_params = RegisterTraderParams::builder()
-            .payer(authority)
+            .payer(payer)
             .trader(authority)
             .trader_account(trader.pda())
             .max_positions(CROSS_MARGIN_MAX_POSITIONS as u64)
@@ -659,6 +703,11 @@ async fn submit_referral_activation_tx(
                 .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
                 .into(),
         );
+        if payer != authority {
+            if let Some(register_ix) = ixs.last_mut() {
+                mark_trader_as_signer(register_ix, &authority);
+            }
+        }
     }
 
     let onboard_params = OnboardTraderDelegatedParams::builder()
@@ -675,8 +724,14 @@ async fn submit_referral_activation_tx(
             .into(),
     );
 
-    let (transaction, recent_blockhash, _) =
-        sign_onboarding_transaction_for_api(ctx, &wallet, ixs, trader_onboarder).await?;
+    let (transaction, recent_blockhash, _) = sign_onboarding_transaction_for_api(
+        ctx,
+        &wallet,
+        fee_payer_wallet.as_ref(),
+        ixs,
+        trader_onboarder,
+    )
+    .await?;
     let response = ctx
         .http_client
         .invite()
@@ -699,7 +754,11 @@ async fn register_authority(
     wallet_name: &str,
     authority: Pubkey,
     referral_code: Option<String>,
+    fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
+    // Offline check, so a bad fee payer fails before any RPC call.
+    let fee_payer_wallet = resolve_fee_payer(ctx, fee_payer, authority)?;
+
     let status = trader_onboarding_status(ctx, &authority).await?;
 
     let sig = if matches!(status, ReferralActivationTraderStatus::Activated) {
@@ -712,7 +771,15 @@ async fn register_authority(
             .map(|code| code.trim().to_string())
             .filter(|code| !code.is_empty())
             .unwrap_or_else(|| DEFAULT_REFERRAL_CODE.to_string());
-        submit_referral_activation_tx(ctx, wallet_name, authority, code, status).await?
+        submit_referral_activation_tx(
+            ctx,
+            wallet_name,
+            authority,
+            code,
+            status,
+            fee_payer_wallet.as_ref(),
+        )
+        .await?
     };
 
     let trader_key = TraderKey::new(authority);
@@ -721,13 +788,18 @@ async fn register_authority(
         trader_pda: trader_key.pda().to_string(),
         dry_run: ctx.dry_run,
         tx_signature: sig,
+        fee_payer: fee_payer_wallet.map(|w| w.pubkey.to_string()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::Signature;
+    use solana_keychain::MemorySigner;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::AccountMeta;
+    use solana_sdk::signature::{Keypair, Signature, Signer as _};
+    use solana_sdk::transaction::Transaction;
 
     fn two_signer_onboarding_tx(
         authority: Pubkey,
@@ -782,5 +854,163 @@ mod tests {
         assert_eq!(format_sol_lamports(1), "0.000000001");
         assert_eq!(format_sol_lamports(1_500_000_000), "1.5");
         assert_eq!(format_sol_lamports(2_000_000_000), "2.0");
+    }
+
+    fn sponsored_register_ix(payer: Pubkey, trader: Pubkey) -> Instruction {
+        let trader_key = TraderKey::new(trader);
+        let params = RegisterTraderParams::builder()
+            .payer(payer)
+            .trader(trader)
+            .trader_account(trader_key.pda())
+            .max_positions(CROSS_MARGIN_MAX_POSITIONS as u64)
+            .trader_pda_index(0)
+            .subaccount_index(0)
+            .build()
+            .expect("register params");
+        create_register_trader_ix(params)
+            .expect("register ix")
+            .into()
+    }
+
+    fn onboarder_only_ix(onboarder: Pubkey) -> Instruction {
+        Instruction {
+            program_id: Pubkey::new_unique(),
+            accounts: vec![AccountMeta::new_readonly(onboarder, true)],
+            data: vec![],
+        }
+    }
+
+    fn memory_signer(keypair: &Keypair) -> MemorySigner {
+        MemorySigner::from_bytes(&keypair.to_bytes()).expect("memory signer")
+    }
+
+    #[test]
+    fn mark_trader_as_signer_flips_only_the_trader_meta() {
+        let payer = Pubkey::new_unique();
+        let trader = Pubkey::new_unique();
+        let mut ix = sponsored_register_ix(payer, trader);
+
+        let before: Vec<_> = ix
+            .accounts
+            .iter()
+            .map(|m| (m.pubkey, m.is_signer, m.is_writable))
+            .collect();
+        let trader_meta = ix
+            .accounts
+            .iter()
+            .find(|m| m.pubkey == trader)
+            .expect("trader meta");
+        assert!(
+            !trader_meta.is_signer,
+            "SDK builder lists the trader as a non-signer"
+        );
+
+        mark_trader_as_signer(&mut ix, &trader);
+
+        for (meta, (pubkey, was_signer, was_writable)) in ix.accounts.iter().zip(before) {
+            assert_eq!(meta.pubkey, pubkey);
+            assert_eq!(
+                meta.is_writable, was_writable,
+                "writability must not change"
+            );
+            if pubkey == trader {
+                assert!(meta.is_signer, "trader must become a signer");
+            } else {
+                assert_eq!(meta.is_signer, was_signer, "other metas must be untouched");
+            }
+        }
+        let payer_meta = ix
+            .accounts
+            .iter()
+            .find(|m| m.pubkey == payer)
+            .expect("payer meta");
+        assert!(payer_meta.is_signer && payer_meta.is_writable);
+    }
+
+    #[tokio::test]
+    async fn sponsored_registration_accumulates_trader_and_payer_signatures() {
+        use solana_keychain::SolanaSigner;
+
+        let payer_kp = Keypair::new();
+        let trader_kp = Keypair::new();
+        let payer = payer_kp.pubkey();
+        let trader = trader_kp.pubkey();
+        let onboarder = Pubkey::new_unique();
+
+        let mut register_ix = sponsored_register_ix(payer, trader);
+        mark_trader_as_signer(&mut register_ix, &trader);
+        let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
+
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = Hash::new_unique();
+        assert_eq!(tx.message.header.num_required_signatures, 3);
+        assert_eq!(
+            tx.message.account_keys[0], payer,
+            "sponsor must be the fee payer"
+        );
+        let message_before = tx.message_data();
+
+        let first = memory_signer(&trader_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("trader sign");
+        assert!(matches!(first, SignTransactionResult::Partial(_)));
+        let second = memory_signer(&payer_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("payer sign");
+        assert!(
+            matches!(second, SignTransactionResult::Partial(_)),
+            "onboarder slot is still open, so the tx must remain partial"
+        );
+
+        assert_eq!(
+            tx.message_data(),
+            message_before,
+            "signing must not alter the message"
+        );
+        let verified = tx.verify_with_results();
+        let slot = |key: &Pubkey| {
+            tx.message
+                .account_keys
+                .iter()
+                .position(|k| k == key)
+                .unwrap()
+        };
+        assert!(verified[slot(&payer)], "sponsor signature must verify");
+        assert!(verified[slot(&trader)], "trader signature must verify");
+        assert_eq!(tx.signatures[slot(&onboarder)], Signature::default());
+
+        validate_partial_onboarding_signatures(&tx, &onboarder)
+            .expect("only the onboarder slot may be missing");
+
+        let (serialized, _) = second.into_signed_transaction();
+        assert!(!serialized.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sponsored_registration_without_payer_signature_is_rejected() {
+        use solana_keychain::SolanaSigner;
+
+        let payer_kp = Keypair::new();
+        let trader_kp = Keypair::new();
+        let payer = payer_kp.pubkey();
+        let trader = trader_kp.pubkey();
+        let onboarder = Pubkey::new_unique();
+
+        let mut register_ix = sponsored_register_ix(payer, trader);
+        mark_trader_as_signer(&mut register_ix, &trader);
+        let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = Hash::new_unique();
+
+        memory_signer(&trader_kp)
+            .sign_transaction(&mut tx)
+            .await
+            .expect("trader sign");
+
+        let err = validate_partial_onboarding_signatures(&tx, &onboarder)
+            .expect_err("missing sponsor signature must be rejected");
+        assert!(err.to_string().contains(&payer.to_string()));
     }
 }

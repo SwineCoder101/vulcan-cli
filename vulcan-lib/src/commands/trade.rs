@@ -1,6 +1,7 @@
 //! Trade command execution.
 
 use crate::cli::trade::TradeCommand;
+use crate::commands::fee_payer::{ensure_sol_for_fee, resolve_fee_payer};
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
@@ -504,6 +505,8 @@ pub async fn send_or_dry_run_with_cu_limit(
     wallet: &ResolvedSigner,
     cu_limit: u32,
 ) -> Result<Option<String>, VulcanError> {
+    let sponsor = resolve_fee_payer(ctx, None, wallet.authority)?;
+
     if ctx.dry_run {
         return Ok(None);
     }
@@ -523,7 +526,7 @@ pub async fn send_or_dry_run_with_cu_limit(
     );
     all_ixs.extend(ixs);
 
-    let fee_payer = signer.pubkey();
+    let mut fee_payer = signer.pubkey();
     if fee_payer != wallet.authority {
         return Err(VulcanError::auth(
             "SIGNER_PUBKEY_MISMATCH",
@@ -533,14 +536,32 @@ pub async fn send_or_dry_run_with_cu_limit(
             ),
         ));
     }
+    if let Some(sponsor) = &sponsor {
+        fee_payer = sponsor.pubkey;
+    }
 
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&all_ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
 
-    let signed = signer
+    if sponsor.is_some() {
+        ensure_sol_for_fee(&rpc_client, fee_payer, &tx.message)?;
+    }
+    let sponsor_signer = match &sponsor {
+        Some(sponsor) => Some(sponsor.signer().await?),
+        None => None,
+    };
+
+    let mut signed = signer
         .sign_transaction(&mut tx)
         .await
         .map_err(|e| VulcanError::auth("TX_SIGN_FAILED", e.to_string()))?;
+    if let Some(sponsor_signer) = &sponsor_signer {
+        signed = sponsor_signer
+            .signer()?
+            .sign_transaction(&mut tx)
+            .await
+            .map_err(|e| VulcanError::auth("FEE_PAYER_TX_SIGN_FAILED", e.to_string()))?;
+    }
 
     if matches!(signed, SignTransactionResult::Partial(_)) {
         return Err(VulcanError::auth(
@@ -2644,5 +2665,70 @@ mod conditional_cancel_id_tests {
         assert!(
             parse_conditional_order_id("ctp-10-1-unknown", TriggerKind::TakeProfit, 10).is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod fee_payer_tests {
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    fn production_only(src: &str) -> String {
+        src.split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn every_transaction_path_is_paymaster_aware() {
+        let commands_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let submit_markers = [
+            "send_and_confirm_transaction(",
+            "send_transaction(",
+            ".sign_transaction(",
+            "new_with_payer(",
+        ];
+        let allowed: BTreeMap<&str, &[&str]> = [
+            ("trade.rs", &["send_or_dry_run_with_cu_limit"][..]),
+            ("account.rs", &["sign_onboarding_transaction_for_api"][..]),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut offenders = Vec::new();
+        let mut tx_modules = Vec::new();
+        for entry in std::fs::read_dir(&commands_dir).unwrap().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = production_only(&std::fs::read_to_string(&path).unwrap());
+            if submit_markers.iter().any(|m| src.contains(m))
+                && !allowed.contains_key(name.as_str())
+            {
+                offenders.push(name.clone());
+            }
+            if src.contains("send_or_dry_run") {
+                tx_modules.push(name);
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "modules submitting transactions outside the paymaster-aware helpers: {offenders:?}"
+        );
+        for required in ["account.rs", "margin.rs", "position.rs", "trade.rs"] {
+            assert!(
+                tx_modules.iter().any(|m| m == required),
+                "{required} no longer routes through send_or_dry_run"
+            );
+        }
+
+        let trade_src =
+            production_only(&std::fs::read_to_string(commands_dir.join("trade.rs")).unwrap());
+        assert_eq!(trade_src.matches("new_with_payer(").count(), 1);
+        let account_src = std::fs::read_to_string(commands_dir.join("account.rs")).unwrap();
+        assert!(account_src.contains("fee_payer_wallet: Option<&ResolvedSigner>"));
     }
 }

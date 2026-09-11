@@ -7,10 +7,13 @@
 //! bite agents in production (plugin host passes blank `userConfig`, CI
 //! shell has no `HOME`, etc.) and unit tests cannot reach them.
 
-use std::io::Write;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vulcan"))
@@ -27,14 +30,14 @@ fn stripped_env(cmd: &mut Command, fake_home: &std::path::Path) {
         .env_remove("VULCAN_WALLET_PASSWORD");
 }
 
-fn create_default_local_wallet(fake_home: &Path) {
+const TEST_WALLET_PASSWORD: &str = "vulcan-test-password";
+
+fn create_local_wallet(fake_home: &Path, name: &str) -> String {
     let mut create = Command::new(bin());
     stripped_env(&mut create, fake_home);
     let out = create
-        .env("VULCAN_WALLET_PASSWORD", "vulcan-test-password")
-        .args([
-            "--yes", "-o", "json", "wallet", "create", "--name", "mcp-test",
-        ])
+        .env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json", "wallet", "create", "--name", name])
         .output()
         .expect("spawn vulcan wallet create");
     assert!(
@@ -43,6 +46,15 @@ fn create_default_local_wallet(fake_home: &Path) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("wallet create JSON");
+    v["data"]["public_key"]
+        .as_str()
+        .expect("wallet create returns public_key")
+        .to_string()
+}
+
+fn create_default_local_wallet(fake_home: &Path) {
+    create_local_wallet(fake_home, "mcp-test");
 
     let mut set_default = Command::new(bin());
     stripped_env(&mut set_default, fake_home);
@@ -255,4 +267,344 @@ fn agent_mcp_install_writes_file_with_0600_perms() {
         "MCP config should be mode 0600, got 0{mode:o} at {}",
         config_path.display()
     );
+}
+
+// ── Sponsored registration (`account register --fee-payer`) ─────────────
+
+/// Run any command with the test wallet password and parse the JSON envelope.
+fn run_json(fake_home: &Path, args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json"])
+        .args(args);
+    let out = cmd.output().expect("spawn vulcan");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+/// Run `account register` with the given extra args and parse the JSON envelope.
+fn register_offline(fake_home: &Path, extra_args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json", "--rpc-url", "http://127.0.0.1:1"])
+        .args(["account", "register"])
+        .args(extra_args);
+    let out = cmd.output().expect("spawn vulcan account register");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
+#[test]
+fn register_with_unknown_fee_payer_fails_before_any_network_access() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    let v = register_offline(tmp.path(), &["--fee-payer", "no-such-wallet"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
+    assert_eq!(v["error"]["category"], "auth", "envelope: {v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("no-such-wallet") && msg.contains("vulcan wallet list"),
+        "message should name the wallet and the remedy, got: {msg}"
+    );
+}
+
+#[test]
+fn register_with_trader_as_fee_payer_is_a_transparent_noop() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    let v = register_offline(tmp.path(), &["--fee-payer", "mcp-test"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+    assert_eq!(v["error"]["category"], "network", "envelope: {v}");
+}
+
+#[test]
+fn register_with_valid_fee_payer_passes_validation_and_reaches_rpc() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    create_local_wallet(tmp.path(), "sponsor");
+
+    let v = register_offline(tmp.path(), &["--dry-run", "--fee-payer", "sponsor"]);
+
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+    assert_eq!(v["error"]["category"], "network", "envelope: {v}");
+}
+
+#[test]
+#[ignore = "needs mainnet RPC access (read-only account fetch); run with --ignored"]
+fn dry_run_sponsored_registration_reports_sponsor_pubkey() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    let sponsor_pubkey = create_local_wallet(tmp.path(), "sponsor");
+
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, tmp.path());
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args([
+            "--yes",
+            "-o",
+            "json",
+            "--dry-run",
+            "account",
+            "register",
+            "--fee-payer",
+            "sponsor",
+        ]);
+    let out = cmd.output().expect("spawn vulcan account register");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    });
+
+    assert_eq!(v["ok"], true, "envelope: {v}");
+    assert_eq!(v["data"]["dry_run"], true, "envelope: {v}");
+    assert_eq!(v["data"]["tx_signature"], serde_json::Value::Null);
+    assert_eq!(v["data"]["fee_payer"], sponsor_pubkey, "envelope: {v}");
+    assert_ne!(
+        v["data"]["authority"], sponsor_pubkey,
+        "trader must differ from sponsor"
+    );
+}
+
+// ── Linked paymaster (`wallet set-fee-payer` / global `--fee-payer`) ─────
+
+#[test]
+fn set_fee_payer_rejects_unknown_wallet() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+
+    let v = run_json(tmp.path(), &["wallet", "set-fee-payer", "no-such-wallet"]);
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "WALLET_NOT_FOUND", "envelope: {v}");
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert!(
+        list["data"]["fee_payer"].is_null(),
+        "no paymaster should be linked after a failed set, got {list}"
+    );
+}
+
+#[test]
+fn linked_paymaster_is_used_by_register_and_can_be_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    let sponsor_pubkey = create_local_wallet(tmp.path(), "sponsor");
+
+    let set = run_json(tmp.path(), &["wallet", "set-fee-payer", "sponsor"]);
+    assert_eq!(set["ok"], true, "envelope: {set}");
+    assert_eq!(set["data"]["name"], "sponsor");
+    assert_eq!(set["data"]["public_key"], sponsor_pubkey);
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert_eq!(list["data"]["fee_payer"], "sponsor", "envelope: {list}");
+
+    let v = register_offline(tmp.path(), &[]);
+    assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
+
+    let v = register_offline_with_global(tmp.path(), &["--fee-payer", "no-such-wallet"]);
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
+
+    let v = register_offline_with_global(tmp.path(), &["-f", "no-such-wallet"]);
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
+
+    let cleared = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
+    assert_eq!(cleared["ok"], true, "envelope: {cleared}");
+    assert_eq!(cleared["data"]["previous"], "sponsor");
+
+    let list = run_json(tmp.path(), &["wallet", "list"]);
+    assert!(list["data"]["fee_payer"].is_null(), "envelope: {list}");
+
+    let cleared_again = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
+    assert_eq!(cleared_again["ok"], true, "envelope: {cleared_again}");
+    assert!(cleared_again["data"]["previous"].is_null());
+}
+
+/// Like `register_offline`, but `global_args` go before the subcommand.
+fn register_offline_with_global(fake_home: &Path, global_args: &[&str]) -> serde_json::Value {
+    let mut args = vec!["--rpc-url", "http://127.0.0.1:1"];
+    args.extend_from_slice(global_args);
+    args.extend_from_slice(&["account", "register"]);
+    run_json(fake_home, &args)
+}
+
+/// Drive the MCP server over stdio, sending each request only after the
+fn mcp_session(
+    fake_home: &Path,
+    extra_env: &[(&str, &str)],
+    requests: &[String],
+) -> HashMap<i64, serde_json::Value> {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    cmd.args(["mcp", "--allow-dangerous"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().expect("spawn vulcan mcp");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                if tx.send(v).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    let mut send = |line: &str| {
+        stdin.write_all(line.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    };
+    let mut responses = HashMap::new();
+    let await_id = |id: i64, responses: &mut HashMap<i64, serde_json::Value>| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let v = rx
+                .recv_timeout(remaining)
+                .unwrap_or_else(|_| panic!("no MCP response for id {id} within 20s"));
+            if let Some(got) = v.get("id").and_then(|i| i.as_i64()) {
+                responses.insert(got, v);
+                if got == id {
+                    return;
+                }
+            }
+        }
+    };
+
+    send(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#,
+    );
+    await_id(1, &mut responses);
+    send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+    for req in requests {
+        let id = serde_json::from_str::<serde_json::Value>(req)
+            .ok()
+            .and_then(|v| v["id"].as_i64())
+            .expect("request has an id");
+        send(req);
+        await_id(id, &mut responses);
+    }
+    drop(stdin);
+    let _ = child.wait();
+    responses
+}
+
+/// The JSON a tool returned: `result.content[0].text` parsed as JSON.
+fn tool_json(v: &serde_json::Value) -> serde_json::Value {
+    let text = v["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("tool call had no text content: {v}"));
+    serde_json::from_str(text).unwrap_or_else(|_| panic!("tool text is not JSON: {text}"))
+}
+
+#[test]
+fn mcp_can_link_and_clear_the_paymaster_mid_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    create_local_wallet(tmp.path(), "sponsor");
+
+    let requests = [
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"vulcan_wallet_set_fee_payer","arguments":{"name":"sponsor"}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"vulcan_wallet_list","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"vulcan_wallet_clear_fee_payer","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"vulcan_wallet_list","arguments":{}}}"#.to_string(),
+        r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"vulcan_wallet_set_fee_payer","arguments":{"name":"no-such-wallet"}}}"#.to_string(),
+    ];
+    let responses = mcp_session(
+        tmp.path(),
+        &[
+            ("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD),
+            ("VULCAN_WALLET_NAME", "mcp-test"),
+        ],
+        &requests,
+    );
+
+    let tools: Vec<String> = responses[&2]["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect();
+    for name in [
+        "vulcan_wallet_set_fee_payer",
+        "vulcan_wallet_clear_fee_payer",
+    ] {
+        assert!(
+            tools.iter().any(|t| t == name),
+            "{name} missing from tools/list: {tools:?}"
+        );
+    }
+
+    let set = tool_json(&responses[&3]);
+    assert_eq!(set["name"], "sponsor", "set result: {set}");
+    assert!(set["public_key"]
+        .as_str()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false));
+
+    let list = tool_json(&responses[&4]);
+    assert_eq!(
+        list["fee_payer"], "sponsor",
+        "link must be visible in the same session: {list}"
+    );
+
+    let cleared = tool_json(&responses[&5]);
+    assert_eq!(cleared["previous"], "sponsor", "clear result: {cleared}");
+
+    let list = tool_json(&responses[&6]);
+    assert!(
+        list["fee_payer"].is_null(),
+        "link must be gone after clear: {list}"
+    );
+
+    let bad = &responses[&7];
+    let is_error = bad["result"]["isError"].as_bool().unwrap_or(false);
+    let text = bad["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        is_error || text.contains("WALLET_NOT_FOUND"),
+        "linking an unknown wallet must fail: {bad}"
+    );
+
+    assert!(!tmp.path().join(".vulcan/wallets/fee_payer").exists());
 }

@@ -428,6 +428,15 @@ impl VulcanMcpServer {
                 let result = commands::wallet::execute_balance_inner(&self.ctx, name.as_deref())?;
                 Ok(serde_json::to_value(result).unwrap())
             }
+            "vulcan_wallet_set_fee_payer" => {
+                let name = arg_str(args, "name")?;
+                let result = commands::wallet::execute_set_fee_payer_inner(&self.ctx, &name)?;
+                Ok(serde_json::to_value(result).unwrap())
+            }
+            "vulcan_wallet_clear_fee_payer" => {
+                let result = commands::wallet::execute_clear_fee_payer_inner(&self.ctx)?;
+                Ok(serde_json::to_value(result).unwrap())
+            }
 
             // ── Portfolio ─────────────────────────────────────────────────
             "vulcan_portfolio" => {
@@ -766,8 +775,13 @@ impl VulcanMcpServer {
                     ));
                 }
                 let referral_code = arg_str_opt(args, "referral_code");
-                let result =
-                    commands::account::execute_register_inner(&self.ctx, referral_code).await?;
+                let fee_payer = arg_str_opt(args, "fee_payer");
+                let result = commands::account::execute_register_inner(
+                    &self.ctx,
+                    referral_code,
+                    fee_payer.as_deref(),
+                )
+                .await?;
                 Ok(serde_json::to_value(result).unwrap())
             }
 
