@@ -710,13 +710,16 @@ async fn submit_referral_activation_tx(
             .subaccount_index(0)
             .build()
             .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?;
-        let mut register_ix: Instruction = create_register_trader_ix(register_params)
-            .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
-            .into();
+        ixs.push(
+            create_register_trader_ix(register_params)
+                .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
+                .into(),
+        );
         if payer != authority {
-            mark_trader_as_signer(&mut register_ix, &authority);
+            if let Some(register_ix) = ixs.last_mut() {
+                mark_trader_as_signer(register_ix, &authority);
+            }
         }
-        ixs.push(register_ix);
     }
 
     let onboard_params = OnboardTraderDelegatedParams::builder()
