@@ -526,7 +526,7 @@ pub async fn send_or_dry_run_with_cu_limit(
     );
     all_ixs.extend(ixs);
 
-    let fee_payer = signer.pubkey();
+    let mut fee_payer = signer.pubkey();
     if fee_payer != wallet.authority {
         return Err(VulcanError::auth(
             "SIGNER_PUBKEY_MISMATCH",
@@ -536,8 +536,9 @@ pub async fn send_or_dry_run_with_cu_limit(
             ),
         ));
     }
-    // A linked paymaster pays the fee; the trader still signs its instructions.
-    let fee_payer = sponsor.as_ref().map(|s| s.pubkey).unwrap_or(fee_payer);
+    if let Some(sponsor) = &sponsor {
+        fee_payer = sponsor.pubkey;
+    }
 
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&all_ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
