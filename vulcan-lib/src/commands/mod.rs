@@ -16,6 +16,7 @@ pub mod position;
 pub mod setup;
 pub mod status;
 pub mod strategy;
+pub mod surfnet;
 pub mod ta;
 pub mod trade;
 pub mod trader_state;

@@ -56,6 +56,8 @@ pub struct AppContext {
     /// Global CLI `--wallet` name: use this stored wallet instead of the default when set.
     /// Ignored when `session_wallet` is present (MCP). Not used by `vulcan mcp` (pass `None`).
     pub wallet_override: Option<String>,
+    /// True when `--surfnet` pointed the RPC at the local Surfpool fork.
+    pub surfnet: bool,
     /// Lazily-initialized metadata (fetched on first use).
     metadata: OnceCell<PhoenixMetadata>,
 }
@@ -78,6 +80,7 @@ impl Clone for AppContext {
             session_wallet: self.session_wallet.clone(),
             api_auth_error: self.api_auth_error.clone(),
             wallet_override: self.wallet_override.clone(),
+            surfnet: self.surfnet,
             metadata: OnceCell::new(),
         }
     }
@@ -95,12 +98,16 @@ impl AppContext {
         rpc_url: Option<String>,
         api_url: Option<String>,
         wallet_override: Option<String>,
+        surfnet: bool,
     ) -> Result<Self> {
         let mut config = VulcanConfig::load()?;
+        let vulcan_dir = VulcanConfig::dir();
 
         // CLI flags override config
         if let Some(rpc) = rpc_url {
             config.network.rpc_url = rpc;
+        } else if surfnet {
+            config.network.rpc_url = crate::commands::surfnet::surfnet_rpc_url(&vulcan_dir);
         }
         if let Some(api) = api_url {
             config.network.api_url = api;
@@ -108,7 +115,6 @@ impl AppContext {
         let wallet_override = wallet_override
             .filter(|w| !w.trim().is_empty())
             .map(|w| w.trim().to_string());
-        let vulcan_dir = VulcanConfig::dir();
         std::fs::create_dir_all(&vulcan_dir)?;
 
         let wallet_store = WalletStore::new(&vulcan_dir)?;
@@ -154,6 +160,7 @@ impl AppContext {
             session_wallet: None,
             api_auth_error,
             wallet_override,
+            surfnet,
             metadata: OnceCell::new(),
         })
     }

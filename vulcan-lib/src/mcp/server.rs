@@ -959,6 +959,11 @@ static RESOURCES: &[(&str, &str, &str)] = &[
         include_str!("../../../skills/vulcan-quickstart/SKILL.md"),
     ),
     (
+        "vulcan://skills/vulcan-surfnet",
+        "Local Surfpool mainnet fork: start/stop, fund, time-travel, snapshots, scenario files",
+        include_str!("../../../skills/vulcan-surfnet/SKILL.md"),
+    ),
+    (
         "vulcan://skills/vulcan-execution-modes",
         "Canonical Observe / Paper / Dry-Run / Confirm-Each / Auto-Execute mode taxonomy",
         include_str!("../../../skills/vulcan-execution-modes/SKILL.md"),

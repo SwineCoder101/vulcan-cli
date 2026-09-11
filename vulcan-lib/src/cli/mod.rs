@@ -10,6 +10,7 @@ pub mod paper;
 pub mod portfolio;
 pub mod position;
 pub mod strategy;
+pub mod surfnet;
 pub mod ta;
 pub mod trade;
 pub mod update;
@@ -41,6 +42,10 @@ pub struct Cli {
     /// Solana RPC endpoint override
     #[arg(long, global = true)]
     pub rpc_url: Option<String>,
+
+    /// Target the local Surfnet (see `vulcan surfnet start`) instead of the configured RPC
+    #[arg(long, global = true, conflicts_with = "rpc_url")]
+    pub surfnet: bool,
 
     /// Phoenix API endpoint override
     #[arg(long, global = true)]
@@ -98,6 +103,10 @@ pub enum Command {
     /// Local paper trading — simulated perps with live prices and no real funds
     #[command(subcommand)]
     Paper(paper::PaperCommand),
+
+    /// Surfnet — local Surfpool mainnet fork for scenario testing (fund, time-travel, snapshots)
+    #[command(subcommand)]
+    Surfnet(surfnet::SurfnetCommand),
 
     /// Trade and account history
     #[command(subcommand)]

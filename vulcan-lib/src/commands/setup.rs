@@ -355,6 +355,7 @@ async fn finish_setup(
         None,
         None,
         None,
+        ctx.surfnet,
     )
     .map_err(|e| VulcanError::config("INIT_FAILED", e.to_string()))?;
 
