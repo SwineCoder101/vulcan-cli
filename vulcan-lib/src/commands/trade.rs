@@ -1,6 +1,7 @@
 //! Trade command execution.
 
 use crate::cli::trade::TradeCommand;
+use crate::commands::fee_payer::{ensure_sol_for_fee, resolve_fee_payer};
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::output::{render_success, TableRenderable};
@@ -12,7 +13,9 @@ use phoenix_rise::{
 };
 use serde::Serialize;
 use solana_keychain::SignTransactionResult;
+use solana_keychain::SolanaSigner;
 use solana_pubkey::Pubkey;
+use solana_sdk::transaction::Transaction;
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -506,7 +509,7 @@ pub async fn send_or_dry_run_with_cu_limit(
 ) -> Result<Option<String>, VulcanError> {
     // Offline validation of the linked paymaster (if any) runs even in dry-run
     // mode so a broken `--fee-payer` / `wallet set-fee-payer` surfaces early.
-    let sponsor = crate::commands::fee_payer::resolve_fee_payer(ctx, None, wallet.authority)?;
+    let sponsor = resolve_fee_payer(ctx, None, wallet.authority)?;
 
     if ctx.dry_run {
         return Ok(None);
@@ -547,14 +550,14 @@ pub async fn send_or_dry_run_with_cu_limit(
     // A paymaster is a shared, easy-to-forget balance: check it can cover the
     // fee before unlocking it, so the user sees amounts instead of an RPC error.
     if sponsor.is_some() {
-        crate::commands::fee_payer::ensure_sol_for_fee(&rpc_client, fee_payer, &tx.message)?;
+        ensure_sol_for_fee(&rpc_client, fee_payer, &tx.message)?;
     }
     let sponsor_signer = match &sponsor {
         Some(sponsor) => Some(sponsor.signer().await?),
         None => None,
     };
 
-    let sponsor_dyn: Option<&dyn solana_keychain::SolanaSigner> = match &sponsor_signer {
+    let sponsor_dyn: Option<&dyn SolanaSigner> = match &sponsor_signer {
         Some(s) => Some(s.signer()?),
         None => None,
     };
@@ -573,9 +576,9 @@ pub async fn send_or_dry_run_with_cu_limit(
 /// signatures on the same transaction: trader first, then the paymaster. The
 /// result must be fully signed; Vulcan never submits a partial transaction.
 async fn sign_fully(
-    tx: &mut solana_sdk::transaction::Transaction,
-    trader: &dyn solana_keychain::SolanaSigner,
-    fee_payer: Option<&dyn solana_keychain::SolanaSigner>,
+    tx: &mut Transaction,
+    trader: &dyn SolanaSigner,
+    fee_payer: Option<&dyn SolanaSigner>,
 ) -> Result<(), VulcanError> {
     let mut signed = trader
         .sign_transaction(tx)
@@ -2690,7 +2693,11 @@ mod conditional_cancel_id_tests {
 #[cfg(test)]
 mod fee_payer_signing_tests {
     use super::*;
+    use solana_keychain::MemorySigner;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::{AccountMeta, Instruction};
     use solana_sdk::signature::{Keypair, Signer as _};
+    use std::path::Path;
 
     /// Every transaction Vulcan submits must go through a paymaster-aware
     /// path. There are exactly two: `send_or_dry_run_with_cu_limit` here (all
@@ -2709,14 +2716,14 @@ mod fee_payer_signing_tests {
 
     #[test]
     fn every_transaction_path_is_paymaster_aware() {
-        let commands_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
+        let commands_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/commands");
         let submit_markers = [
             "send_and_confirm_transaction(",
             "send_transaction(",
             ".sign_transaction(",
             "new_with_payer(",
         ];
-        let allowed: std::collections::BTreeMap<&str, &[&str]> = [
+        let allowed: BTreeMap<&str, &[&str]> = [
             (
                 "trade.rs",
                 &["send_or_dry_run_with_cu_limit", "sign_fully"][..],
@@ -2772,16 +2779,16 @@ mod fee_payer_signing_tests {
         );
     }
 
-    fn trader_ix(trader: Pubkey) -> solana_sdk::instruction::Instruction {
-        solana_sdk::instruction::Instruction {
+    fn trader_ix(trader: Pubkey) -> Instruction {
+        Instruction {
             program_id: Pubkey::new_unique(),
-            accounts: vec![solana_sdk::instruction::AccountMeta::new(trader, true)],
+            accounts: vec![AccountMeta::new(trader, true)],
             data: vec![],
         }
     }
 
-    fn dyn_signer(kp: &Keypair) -> solana_keychain::MemorySigner {
-        solana_keychain::MemorySigner::from_bytes(&kp.to_bytes()).unwrap()
+    fn dyn_signer(kp: &Keypair) -> MemorySigner {
+        MemorySigner::from_bytes(&kp.to_bytes()).unwrap()
     }
 
     #[tokio::test]
@@ -2789,11 +2796,8 @@ mod fee_payer_signing_tests {
         let trader_kp = Keypair::new();
         let sponsor_kp = Keypair::new();
         let (trader, sponsor) = (trader_kp.pubkey(), sponsor_kp.pubkey());
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader)],
-            Some(&sponsor),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut tx = Transaction::new_with_payer(&[trader_ix(trader)], Some(&sponsor));
+        tx.message.recent_blockhash = Hash::new_unique();
         assert_eq!(
             tx.message.account_keys[0], sponsor,
             "paymaster is the fee payer"
@@ -2814,11 +2818,8 @@ mod fee_payer_signing_tests {
     async fn missing_paymaster_signature_is_rejected() {
         let trader_kp = Keypair::new();
         let sponsor = Keypair::new().pubkey();
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader_kp.pubkey())],
-            Some(&sponsor),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut tx = Transaction::new_with_payer(&[trader_ix(trader_kp.pubkey())], Some(&sponsor));
+        tx.message.recent_blockhash = Hash::new_unique();
 
         let err = sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
             .await
@@ -2830,11 +2831,8 @@ mod fee_payer_signing_tests {
     async fn trader_alone_pays_without_paymaster() {
         let trader_kp = Keypair::new();
         let trader = trader_kp.pubkey();
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(
-            &[trader_ix(trader)],
-            Some(&trader),
-        );
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut tx = Transaction::new_with_payer(&[trader_ix(trader)], Some(&trader));
+        tx.message.recent_blockhash = Hash::new_unique();
 
         sign_fully(&mut tx, &dyn_signer(&trader_kp), None)
             .await

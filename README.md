@@ -222,7 +222,7 @@ Available on every command:
 | --------------- | ----------------------------------------------------- |
 | `-o, --output`  | `json` or `table` (default `table`).                  |
 | `-w, --wallet`  | Use a specific stored wallet instead of the default.  |
-| `--fee-payer`   | Stored wallet that pays fees and rent for this run (paymaster). |
+| `-f, --fee-payer` | Stored wallet that pays fees and rent for this run (paymaster). |
 | `--dry-run`     | Simulate the action without submitting a transaction. |
 | `-y, --yes`     | Skip interactive confirmation prompts.                |
 | `--watch`       | Stream live updates via WebSocket where supported.    |

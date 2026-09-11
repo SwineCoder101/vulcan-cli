@@ -20,6 +20,7 @@ use serde::Serialize;
 use solana_keychain::SignTransactionResult;
 use solana_pubkey::Pubkey;
 use solana_rpc_client_api::config::RpcSimulateTransactionConfig;
+use solana_sdk::instruction::Instruction;
 use std::str::FromStr;
 
 const CROSS_MARGIN_MAX_POSITIONS: u32 = 128;
@@ -529,7 +530,7 @@ async fn sign_onboarding_transaction_for_api(
 
 /// The SDK's RegisterTrader builder lists the trader as a readonly non-signer.
 /// When someone else pays, the trader must co-sign to authorize the registration.
-fn mark_trader_as_signer(ix: &mut solana_sdk::instruction::Instruction, trader: &Pubkey) {
+fn mark_trader_as_signer(ix: &mut Instruction, trader: &Pubkey) {
     for meta in ix.accounts.iter_mut() {
         if meta.pubkey == *trader {
             meta.is_signer = true;
@@ -697,10 +698,9 @@ async fn submit_referral_activation_tx(
             .subaccount_index(0)
             .build()
             .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?;
-        let mut register_ix: solana_sdk::instruction::Instruction =
-            create_register_trader_ix(register_params)
-                .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
-                .into();
+        let mut register_ix: Instruction = create_register_trader_ix(register_params)
+            .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
+            .into();
         if payer != authority {
             // Sponsored registration: the payer covers fee and rent, but the trader
             // authority must still sign to authorize its own registration.
@@ -795,7 +795,11 @@ async fn register_authority(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use solana_sdk::signature::{Signature, Signer as _};
+    use solana_keychain::MemorySigner;
+    use solana_sdk::hash::Hash;
+    use solana_sdk::instruction::AccountMeta;
+    use solana_sdk::signature::{Keypair, Signature, Signer as _};
+    use solana_sdk::transaction::Transaction;
 
     fn two_signer_onboarding_tx(
         authority: Pubkey,
@@ -854,10 +858,7 @@ mod tests {
 
     // ── Sponsored registration (--fee-payer) ─────────────────────────────
 
-    fn sponsored_register_ix(
-        payer: Pubkey,
-        trader: Pubkey,
-    ) -> solana_sdk::instruction::Instruction {
+    fn sponsored_register_ix(payer: Pubkey, trader: Pubkey) -> Instruction {
         let trader_key = TraderKey::new(trader);
         let params = RegisterTraderParams::builder()
             .payer(payer)
@@ -874,18 +875,16 @@ mod tests {
     }
 
     /// Stand-in for OnboardTraderDelegated: only the onboarder is a signer.
-    fn onboarder_only_ix(onboarder: Pubkey) -> solana_sdk::instruction::Instruction {
-        solana_sdk::instruction::Instruction {
+    fn onboarder_only_ix(onboarder: Pubkey) -> Instruction {
+        Instruction {
             program_id: Pubkey::new_unique(),
-            accounts: vec![solana_sdk::instruction::AccountMeta::new_readonly(
-                onboarder, true,
-            )],
+            accounts: vec![AccountMeta::new_readonly(onboarder, true)],
             data: vec![],
         }
     }
 
-    fn memory_signer(keypair: &solana_sdk::signature::Keypair) -> solana_keychain::MemorySigner {
-        solana_keychain::MemorySigner::from_bytes(&keypair.to_bytes()).expect("memory signer")
+    fn memory_signer(keypair: &Keypair) -> MemorySigner {
+        MemorySigner::from_bytes(&keypair.to_bytes()).expect("memory signer")
     }
 
     #[test]
@@ -935,8 +934,8 @@ mod tests {
     async fn sponsored_registration_accumulates_trader_and_payer_signatures() {
         use solana_keychain::SolanaSigner;
 
-        let payer_kp = solana_sdk::signature::Keypair::new();
-        let trader_kp = solana_sdk::signature::Keypair::new();
+        let payer_kp = Keypair::new();
+        let trader_kp = Keypair::new();
         let payer = payer_kp.pubkey();
         let trader = trader_kp.pubkey();
         let onboarder = Pubkey::new_unique();
@@ -945,8 +944,8 @@ mod tests {
         mark_trader_as_signer(&mut register_ix, &trader);
         let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
 
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&payer));
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = Hash::new_unique();
         assert_eq!(tx.message.header.num_required_signatures, 3);
         assert_eq!(
             tx.message.account_keys[0], payer,
@@ -998,8 +997,8 @@ mod tests {
     async fn sponsored_registration_without_payer_signature_is_rejected() {
         use solana_keychain::SolanaSigner;
 
-        let payer_kp = solana_sdk::signature::Keypair::new();
-        let trader_kp = solana_sdk::signature::Keypair::new();
+        let payer_kp = Keypair::new();
+        let trader_kp = Keypair::new();
         let payer = payer_kp.pubkey();
         let trader = trader_kp.pubkey();
         let onboarder = Pubkey::new_unique();
@@ -1007,8 +1006,8 @@ mod tests {
         let mut register_ix = sponsored_register_ix(payer, trader);
         mark_trader_as_signer(&mut register_ix, &trader);
         let ixs = vec![register_ix, onboarder_only_ix(onboarder)];
-        let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&payer));
-        tx.message.recent_blockhash = solana_sdk::hash::Hash::new_unique();
+        let mut tx = Transaction::new_with_payer(&ixs, Some(&payer));
+        tx.message.recent_blockhash = Hash::new_unique();
 
         memory_signer(&trader_kp)
             .sign_transaction(&mut tx)

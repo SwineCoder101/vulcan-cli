@@ -761,11 +761,7 @@ pub fn execute_set_fee_payer_inner(
 /// Unlink the paymaster (CLI `wallet clear-fee-payer`, MCP `vulcan_wallet_clear_fee_payer`).
 pub fn execute_clear_fee_payer_inner(ctx: &AppContext) -> Result<FeePayerCleared, VulcanError> {
     let previous = ctx.wallet_store.clear_fee_payer().map_err(|e| {
-        VulcanError::new(
-            crate::error::ErrorCategory::Io,
-            "FEE_PAYER_CLEAR_FAILED",
-            e.to_string(),
-        )
+        VulcanError::new(ErrorCategory::Io, "FEE_PAYER_CLEAR_FAILED", e.to_string())
     })?;
     Ok(FeePayerCleared { previous })
 }

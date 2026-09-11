@@ -5,10 +5,13 @@
 //! paymaster is a second local signer. It gains no authority over the trader's
 //! funds or positions; Phoenix still requires the trader wallet to sign.
 
+use crate::commands::trade::prompt_password;
 use crate::context::AppContext;
 use crate::error::VulcanError;
 use crate::wallet::{ResolvedSigner, WalletFile, WalletStore};
 use solana_pubkey::Pubkey;
+use solana_rpc_client::rpc_client::RpcClient;
+use solana_sdk::message::Message;
 use std::str::FromStr;
 
 /// A stored sponsor wallet validated for use as fee payer, before any network access.
@@ -56,7 +59,7 @@ impl FeePayerWallet {
     /// Unlock the sponsor wallet for signing (prompts for a password if needed).
     pub async fn signer(&self) -> Result<ResolvedSigner, VulcanError> {
         let password = if self.wallet_file.is_local_encrypted() {
-            Some(crate::commands::trade::prompt_password()?)
+            Some(prompt_password()?)
         } else {
             None
         };
@@ -157,9 +160,9 @@ pub(crate) fn check_fee_balance(
 
 /// Look up the paymaster's SOL balance and the fee for `message`, then check it.
 pub(crate) fn ensure_sol_for_fee(
-    rpc: &solana_rpc_client::rpc_client::RpcClient,
+    rpc: &RpcClient,
     payer: Pubkey,
-    message: &solana_sdk::message::Message,
+    message: &Message,
 ) -> Result<(), VulcanError> {
     let fee_lamports = rpc
         .get_fee_for_message(message)
@@ -174,6 +177,7 @@ pub(crate) fn ensure_sol_for_fee(
 mod tests {
     use super::*;
     use crate::wallet::WalletSignerConfig;
+    use std::mem::ManuallyDrop;
 
     fn store_with(names: &[&str]) -> (tempfile::TempDir, WalletStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -251,7 +255,7 @@ mod tests {
     #[test]
     fn linking_an_unknown_wallet_is_rejected_and_dangling_links_are_ignored() {
         let (dir, store) = store_with(&["sponsor"]);
-        let dir = std::mem::ManuallyDrop::new(dir);
+        let dir = ManuallyDrop::new(dir);
         assert!(store.set_fee_payer("nope").is_err());
         store.set_fee_payer("sponsor").unwrap();
         // Simulate the sponsor wallet being removed after linking.

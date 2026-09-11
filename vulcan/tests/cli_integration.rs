@@ -7,10 +7,13 @@
 //! bite agents in production (plugin host passes blank `userConfig`, CI
 //! shell has no `HOME`, etc.) and unit tests cannot reach them.
 
-use std::io::Write;
+use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_vulcan"))
@@ -440,6 +443,13 @@ fn linked_paymaster_is_used_by_register_and_can_be_cleared() {
         "envelope: {v}"
     );
 
+    // The short alias `-f` is the same flag.
+    let v = register_offline_with_global(tmp.path(), &["-f", "no-such-wallet"]);
+    assert_eq!(
+        v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
+        "envelope: {v}"
+    );
+
     let cleared = run_json(tmp.path(), &["wallet", "clear-fee-payer"]);
     assert_eq!(cleared["ok"], true, "envelope: {cleared}");
     assert_eq!(cleared["data"]["previous"], "sponsor");
@@ -467,9 +477,7 @@ fn mcp_session(
     fake_home: &Path,
     extra_env: &[(&str, &str)],
     requests: &[String],
-) -> std::collections::HashMap<i64, serde_json::Value> {
-    use std::io::BufRead;
-
+) -> HashMap<i64, serde_json::Value> {
     let mut cmd = Command::new(bin());
     stripped_env(&mut cmd, fake_home);
     for (k, v) in extra_env {
@@ -483,12 +491,9 @@ fn mcp_session(
     let mut stdin = child.stdin.take().expect("stdin");
     let stdout = child.stdout.take().expect("stdout");
 
-    let (tx, rx) = std::sync::mpsc::channel::<serde_json::Value>();
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
+    let (tx, rx) = mpsc::channel::<serde_json::Value>();
+    thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                 if tx.send(v).is_err() {
                     break;
@@ -502,11 +507,11 @@ fn mcp_session(
         stdin.write_all(b"\n").unwrap();
         stdin.flush().unwrap();
     };
-    let mut responses = std::collections::HashMap::new();
-    let await_id = |id: i64, responses: &mut std::collections::HashMap<i64, serde_json::Value>| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let mut responses = HashMap::new();
+    let await_id = |id: i64, responses: &mut HashMap<i64, serde_json::Value>| {
+        let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(Instant::now());
             let v = rx
                 .recv_timeout(remaining)
                 .unwrap_or_else(|_| panic!("no MCP response for id {id} within 20s"));
