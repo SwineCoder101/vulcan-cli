@@ -122,6 +122,20 @@ After restart, dangerous tools (live trades, deposits, withdrawals, cancellation
 vulcan agent mcp set-wallet <wallet-name> --target claude --scope user
 ```
 
+### Paymaster (optional)
+
+Link a second stored wallet that pays Solana fees and registration rent for every command, so the trader wallet only ever needs to hold USDC collateral. The trader wallet still signs every transaction; the paymaster gains no authority over funds or positions.
+
+```bash
+vulcan wallet create --name sponsor          # fund this one with SOL
+vulcan wallet set-fee-payer sponsor
+vulcan account register                      # rent + fee paid by sponsor
+vulcan trade SOL long --notional-usdc 100 -y # fee paid by sponsor
+vulcan wallet clear-fee-payer                # back to the trader wallet paying
+```
+
+`--fee-payer <name>` overrides the linked paymaster for a single command. Over MCP, use `vulcan_wallet_set_fee_payer` / `vulcan_wallet_clear_fee_payer`; the link applies to the next transaction without restarting the server.
+
 ### Inspecting and repairing
 
 ```bash
@@ -208,6 +222,7 @@ Available on every command:
 | --------------- | ----------------------------------------------------- |
 | `-o, --output`  | `json` or `table` (default `table`).                  |
 | `-w, --wallet`  | Use a specific stored wallet instead of the default.  |
+| `-f, --fee-payer` | Stored wallet that pays fees and rent for this run (paymaster). |
 | `--dry-run`     | Simulate the action without submitting a transaction. |
 | `-y, --yes`     | Skip interactive confirmation prompts.                |
 | `--watch`       | Stream live updates via WebSocket where supported.    |

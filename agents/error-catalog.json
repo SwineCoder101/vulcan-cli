@@ -168,6 +168,22 @@
       "category": "validation",
       "recovery": "Fund the wallet with enough SOL for cross-margin trader account rent, then retry registration"
     },
+    "FEE_PAYER_WALLET_NOT_FOUND": {
+      "category": "auth",
+      "recovery": "The fee payer wallet (global --fee-payer or `vulcan wallet set-fee-payer`) is not in the local wallet store. Check `vulcan wallet list`, import the sponsor wallet, or run `vulcan wallet clear-fee-payer`"
+    },
+    "INSUFFICIENT_SOL_FOR_FEE": {
+      "category": "validation",
+      "recovery": "The paymaster wallet cannot cover this transaction's fee. Fund it with SOL (the message shows its balance and the required fee) or run `vulcan wallet clear-fee-payer` to let the trader wallet pay"
+    },
+    "FEE_ESTIMATE_FAILED": {
+      "category": "network",
+      "recovery": "The RPC could not estimate the transaction fee. Retry, or pass --rpc-url to use a different endpoint"
+    },
+    "FEE_PAYER_TX_SIGN_FAILED": {
+      "category": "auth",
+      "recovery": "The fee payer wallet could not sign the registration transaction. Check its password or signer provider credentials and retry"
+    },
     "REGISTRATION_SIMULATION_FAILED": {
       "category": "tx_failed",
       "recovery": "Check the simulation logs, payer SOL balance, and account state before retrying registration"

@@ -7,6 +7,7 @@ pub mod account;
 pub mod agent;
 pub mod auth;
 pub mod conditional_orders;
+pub mod fee_payer;
 pub mod history;
 pub mod margin;
 pub mod market;

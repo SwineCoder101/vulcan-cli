@@ -50,6 +50,10 @@ pub struct Cli {
     #[arg(short, long, global = true)]
     pub wallet: Option<String>,
 
+    /// Stored wallet that pays fees and rent instead of the trader wallet (overrides `wallet set-fee-payer`)
+    #[arg(short = 'f', long, global = true)]
+    pub fee_payer: Option<String>,
+
     /// Enable verbose/debug logging to stderr
     #[arg(short, long, default_value = "false", global = true)]
     pub verbose: bool,

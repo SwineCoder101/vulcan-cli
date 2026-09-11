@@ -355,6 +355,7 @@ async fn finish_setup(
         None,
         None,
         None,
+        ctx.fee_payer.clone(),
     )
     .map_err(|e| VulcanError::config("INIT_FAILED", e.to_string()))?;
 
@@ -574,7 +575,8 @@ async fn maybe_register_trader(
     let code = prompt("  Referral code (optional): ")?;
     let referral_code = if code.is_empty() { None } else { Some(code) };
 
-    let result = account::execute_register_wallet_inner(ctx, &wallet_name, referral_code).await?;
+    let result =
+        account::execute_register_wallet_inner(ctx, &wallet_name, referral_code, None).await?;
     println!("  ✓ Trader account registered");
     println!("    Trader PDA: {}", result.trader_pda);
     if let Some(sig) = result.tx_signature {

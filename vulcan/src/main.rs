@@ -32,6 +32,7 @@ async fn main() {
         cli.rpc_url,
         cli.api_url,
         cli.wallet.clone(),
+        cli.fee_payer.clone(),
     ) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -409,6 +410,7 @@ async fn run_mcp(
         None,
         None,
         None, // `--wallet` is not used for MCP; session uses VULCAN_WALLET_NAME / default
+        None, // fee payer comes from the linked paymaster (`vulcan wallet set-fee-payer`)
     )
     .map_err(|e| VulcanError::config("MCP_INIT_FAILED", e.to_string()))?;
 
