@@ -93,6 +93,10 @@ const SKILLS: &[SkillSpec] = &[
         contents: include_str!("../../../skills/vulcan-quickstart/SKILL.md"),
     },
     SkillSpec {
+        name: "vulcan-surfnet",
+        contents: include_str!("../../../skills/vulcan-surfnet/SKILL.md"),
+    },
+    SkillSpec {
         name: "vulcan-execution-modes",
         contents: include_str!("../../../skills/vulcan-execution-modes/SKILL.md"),
     },

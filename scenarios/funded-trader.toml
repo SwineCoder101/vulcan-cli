@@ -1,0 +1,37 @@
+# Vulcan Surfnet scenario — apply with `vulcan surfnet scenario run scenarios/funded-trader.toml --start`
+name = "funded-trader"
+description = "Fork mainnet, fund the default trader wallet and a paymaster, then freeze the clock."
+
+[network]
+network = "mainnet"          # mainnet | devnet | testnet, or set rpc_url
+port = 8899
+snapshots = []               # JSON files from `vulcan surfnet snapshot --out ...`
+skip_signature_verification = false
+
+# Fund stored wallets by name (or any pubkey) with SOL and USDC.
+[[fund]]
+wallet = "trader"
+sol = 5
+usdc = 10000
+
+[[fund]]
+wallet = "sponsor"
+sol = 50
+
+# Raw account overrides (surfnet_setAccount). Useful for patching oracles or
+# cloning a whale's trader account. Data is base64.
+# [[account]]
+# pubkey = "..."
+# lamports = 1000000000
+# owner = "..."
+# data_base64 = "..."
+
+# txtx runbooks executed with `surfpool run` after funding (optional).
+# [[runbook]]
+# id = "seed"
+# manifest = "txtx.yml"
+# inputs = ["inputs.json"]
+
+[clock]
+travel_forward = "1h"        # or travel_to_slot / travel_to_timestamp
+pause = true

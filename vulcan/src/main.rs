@@ -32,6 +32,7 @@ async fn main() {
         cli.rpc_url,
         cli.api_url,
         cli.wallet.clone(),
+        cli.surfnet,
     ) {
         Ok(ctx) => ctx,
         Err(e) => {
@@ -68,6 +69,7 @@ async fn main() {
         Command::Auth(cmd) => vulcan_lib::commands::auth::execute(&ctx, cmd).await,
         Command::Portfolio(args) => vulcan_lib::commands::portfolio::execute(&ctx, args).await,
         Command::Paper(cmd) => vulcan_lib::commands::paper::execute(&ctx, cmd).await,
+        Command::Surfnet(cmd) => vulcan_lib::commands::surfnet::execute(&ctx, cmd).await,
         Command::History(cmd) => vulcan_lib::commands::history::execute(&ctx, cmd).await,
         Command::Agent(cmd) => vulcan_lib::commands::agent::execute(&ctx, cmd).await,
         Command::Strategy(cmd) => vulcan_lib::commands::strategy::execute(&ctx, cmd).await,
@@ -137,6 +139,7 @@ fn command_log_name(command: &Command) -> &'static str {
     use vulcan_lib::cli::paper::PaperCommand;
     use vulcan_lib::cli::position::PositionCommand;
     use vulcan_lib::cli::strategy::{GridCommand, StrategyCommand, TaCommand, TwapCommand};
+    use vulcan_lib::cli::surfnet::SurfnetCommand;
     use vulcan_lib::cli::trade::TradeCommand;
 
     match command {
@@ -183,6 +186,17 @@ fn command_log_name(command: &Command) -> &'static str {
             AuthCommand::Logout => "auth.logout",
         },
         Command::Portfolio(_) => "portfolio",
+        Command::Surfnet(cmd) => match cmd {
+            SurfnetCommand::Start(_) => "surfnet.start",
+            SurfnetCommand::Stop => "surfnet.stop",
+            SurfnetCommand::Status => "surfnet.status",
+            SurfnetCommand::Fund(_) => "surfnet.fund",
+            SurfnetCommand::TimeTravel(_) => "surfnet.time_travel",
+            SurfnetCommand::Clock { .. } => "surfnet.clock",
+            SurfnetCommand::Snapshot { .. } => "surfnet.snapshot",
+            SurfnetCommand::Reset => "surfnet.reset",
+            SurfnetCommand::Scenario(_) => "surfnet.scenario",
+        },
         Command::Paper(cmd) => match cmd {
             PaperCommand::Init { .. } => "paper.init",
             PaperCommand::Reset { .. } => "paper.reset",
@@ -408,7 +422,8 @@ async fn run_mcp(
         false, // watch
         None,
         None,
-        None, // `--wallet` is not used for MCP; session uses VULCAN_WALLET_NAME / default
+        None,  // `--wallet` is not used for MCP; session uses VULCAN_WALLET_NAME / default
+        false, // MCP targets the configured RPC; pass --rpc-url to point it at a Surfnet
     )
     .map_err(|e| VulcanError::config("MCP_INIT_FAILED", e.to_string()))?;
 

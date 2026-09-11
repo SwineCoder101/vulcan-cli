@@ -172,6 +172,10 @@ For a market order sized with `tokens` or `notional_usdc`:
 
 `vulcan_market_ticker` is recommended for user-facing context, not required for lot conversion. If passing base-lot `size`, call `vulcan_market_info` first.
 
+## Surfnet (Local Fork)
+
+`vulcan surfnet start` runs a local Surfpool fork of mainnet; `vulcan --surfnet <command>` targets it instead of the configured RPC. Surfnet commands (`start`, `stop`, `status`, `fund`, `time-travel`, `clock`, `snapshot`, `reset`, `scenario`) never touch mainnet and need no acknowledgement. Phoenix API reads (`portfolio`, `position`, `history`, market data) still reflect mainnet even with `--surfnet`. See `docs/surfnet-integration.md` and the `vulcan-surfnet` skill.
+
 ## Error Handling
 
 Failures use this envelope:

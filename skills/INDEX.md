@@ -1,6 +1,6 @@
 # Skills Index
 
-18 agent skills for `vulcan`, organized by category.
+19 agent skills for `vulcan`, organized by category.
 
 ## Context Loading Model
 
@@ -32,6 +32,7 @@ Execution modes, risk management, and error recovery.
 | [vulcan-execution-modes](./vulcan-execution-modes/SKILL.md) | **Canonical taxonomy**: Observe / Paper / Dry-Run / Confirm-Each / Auto-Execute. Lists what each mode does, when to ask the user which mode, how to format the question, and what follow-up to collect per mode. Strategy skills (TWAP, grid, TA) all defer to this. |
 | [vulcan-risk-management](./vulcan-risk-management/SKILL.md) | Pre-trade risk checks, leverage tiers, margin health, and when to warn. |
 | [vulcan-error-recovery](./vulcan-error-recovery/SKILL.md)   | Error category routing, tx_failed recovery, and network error handling. |
+| [vulcan-surfnet](./vulcan-surfnet/SKILL.md)                 | Local Surfpool mainnet fork: start/stop, fund, time-travel, snapshots, scenario files. Real on-chain flows with fake funds. |
 
 
 ## Trading

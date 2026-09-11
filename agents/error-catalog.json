@@ -168,6 +168,50 @@
       "category": "validation",
       "recovery": "Fund the wallet with enough SOL for cross-margin trader account rent, then retry registration"
     },
+    "SURFPOOL_NOT_INSTALLED": {
+      "category": "config",
+      "recovery": "Install Surfpool with `curl -sL https://run.surfpool.run/ | bash` (or `brew install txtx/taps/surfpool`) and retry"
+    },
+    "SURFNET_NOT_RUNNING": {
+      "category": "network",
+      "recovery": "No healthy Surfnet at the recorded URL. Run `vulcan surfnet start`, then retry"
+    },
+    "SURFNET_ALREADY_RUNNING": {
+      "category": "validation",
+      "recovery": "A Surfnet started by Vulcan is still running. Use it, or `vulcan surfnet stop` before starting another"
+    },
+    "SURFNET_PORT_IN_USE": {
+      "category": "validation",
+      "recovery": "Another RPC server answers on that port. Pass a different --port or stop the other process"
+    },
+    "SURFNET_START_TIMEOUT": {
+      "category": "network",
+      "recovery": "Surfpool did not become healthy in time (mainnet datasource may be slow). Check ~/.vulcan/surfnet.log and retry with a larger --wait-secs"
+    },
+    "SURFNET_UNREACHABLE": {
+      "category": "network",
+      "recovery": "The Surfnet stopped answering. Check `vulcan surfnet status` and restart it if needed"
+    },
+    "SURFNET_RPC_ERROR": {
+      "category": "api",
+      "recovery": "A surfnet_* cheatcode rejected the call. The message names the method; check the arguments (pubkeys, amounts, slot/timestamp)"
+    },
+    "SURFNET_INVALID_TARGET": {
+      "category": "validation",
+      "recovery": "Pass a stored wallet name (`vulcan wallet list`) or a base58 pubkey"
+    },
+    "SURFNET_INVALID_DURATION": {
+      "category": "validation",
+      "recovery": "Use durations like 90s, 30m, 2h, 1d, or 1h30m"
+    },
+    "SCENARIO_INVALID": {
+      "category": "validation",
+      "recovery": "Fix the scenario file; `vulcan surfnet scenario example` prints a valid template"
+    },
+    "RUNBOOK_FAILED": {
+      "category": "tx_failed",
+      "recovery": "The txtx runbook exited non-zero. Run `surfpool run <id>` manually in the scenario directory to see its output"
+    },
     "REGISTRATION_SIMULATION_FAILED": {
       "category": "tx_failed",
       "recovery": "Check the simulation logs, payer SOL balance, and account state before retrying registration"

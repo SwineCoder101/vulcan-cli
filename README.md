@@ -167,6 +167,21 @@ Plaintext private-key export is user-only. Agents should explain the risk and pr
 
 See `AGENTS.md` for full integration details.
 
+## Surfnet (local mainnet fork)
+
+Test real Vulcan transactions against a [Surfpool](https://surfpool.run) fork of mainnet with fake funds:
+
+```bash
+vulcan surfnet start                              # needs `surfpool` on PATH
+vulcan surfnet fund trader --sol 5 --usdc 10000
+vulcan --surfnet wallet balance
+vulcan surfnet time-travel --forward 1h
+vulcan surfnet scenario run scenarios/funded-trader.toml
+vulcan surfnet stop
+```
+
+Scope and roadmap: `docs/surfnet-integration.md`.
+
 ## Command Groups
 
 
@@ -176,6 +191,7 @@ See `AGENTS.md` for full integration details.
 | `status`        | Health check for config, wallet, RPC, API, registration, and balances.                    |
 | `market`        | Market list, ticker, market info, orderbook, and candles.                                 |
 | `paper`         | Local paper trading with live prices and no real funds.                                   |
+| `surfnet`       | Local Surfpool mainnet fork: start/stop, fund, time-travel, snapshots, scenario files.     |
 | `trade`         | Place and manage live orders, cancellations, multi-limit orders, and TP/SL.               |
 | `position`      | List, show, close, reduce, and attach TP/SL to positions.                                 |
 | `margin`        | Deposit, withdraw, transfer collateral, add isolated collateral, and view leverage tiers. |
@@ -213,6 +229,7 @@ Available on every command:
 | `--watch`       | Stream live updates via WebSocket where supported.    |
 | `-v, --verbose` | Verbose/debug logging to stderr.                      |
 | `--rpc-url`     | Override the Solana RPC endpoint.                     |
+| `--surfnet`     | Target the local Surfnet from `vulcan surfnet start`. |
 | `--api-url`     | Override the Phoenix API endpoint.                    |
 
 

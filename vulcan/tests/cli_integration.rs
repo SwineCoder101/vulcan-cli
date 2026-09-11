@@ -27,6 +27,25 @@ fn stripped_env(cmd: &mut Command, fake_home: &std::path::Path) {
         .env_remove("VULCAN_WALLET_PASSWORD");
 }
 
+const TEST_WALLET_PASSWORD: &str = "vulcan-test-password";
+
+/// Run any command with the test wallet password and parse the JSON envelope.
+fn run_json(fake_home: &Path, args: &[&str]) -> serde_json::Value {
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, fake_home);
+    cmd.env("VULCAN_WALLET_PASSWORD", TEST_WALLET_PASSWORD)
+        .args(["--yes", "-o", "json"])
+        .args(args);
+    let out = cmd.output().expect("spawn vulcan");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(&stdout).unwrap_or_else(|_| {
+        panic!(
+            "not JSON: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+
 fn create_default_local_wallet(fake_home: &Path) {
     let mut create = Command::new(bin());
     stripped_env(&mut create, fake_home);
@@ -254,5 +273,136 @@ fn agent_mcp_install_writes_file_with_0600_perms() {
         0o600,
         "MCP config should be mode 0600, got 0{mode:o} at {}",
         config_path.display()
+    );
+}
+
+// ── Surfnet (local Surfpool fork) ────────────────────────────────────────
+
+/// Point Vulcan's recorded Surfnet at a closed port so every check is hermetic.
+fn write_dead_surfnet_state(fake_home: &Path) {
+    let dir = fake_home.join(".vulcan");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("surfnet.json"),
+        r#"{"rpc_url":"http://127.0.0.1:1","ws_url":"ws://127.0.0.1:2","network":"mainnet","pid":null,"started_at":"2026-01-01T00:00:00Z","log_path":"/dev/null"}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn surfnet_status_reports_not_running_without_a_fork() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_dead_surfnet_state(tmp.path());
+
+    let v = run_json(tmp.path(), &["surfnet", "status"]);
+    assert_eq!(v["ok"], true, "envelope: {v}");
+    assert_eq!(v["data"]["running"], false, "envelope: {v}");
+    assert_eq!(v["data"]["rpc_url"], "http://127.0.0.1:1");
+}
+
+#[test]
+fn surfnet_fund_fails_clearly_when_no_fork_is_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    write_dead_surfnet_state(tmp.path());
+
+    let v = run_json(tmp.path(), &["surfnet", "fund", "mcp-test", "--sol", "1"]);
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "SURFNET_NOT_RUNNING", "envelope: {v}");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("vulcan surfnet start"),
+        "should point at the remedy: {v}"
+    );
+}
+
+#[test]
+fn surfnet_scenario_example_round_trips_through_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, tmp.path());
+    let out = cmd
+        .args(["surfnet", "scenario", "example"])
+        .output()
+        .expect("spawn");
+    assert!(out.status.success());
+    let file = tmp.path().join("scenario.toml");
+    std::fs::write(&file, &out.stdout).unwrap();
+
+    let v = run_json(
+        tmp.path(),
+        &["surfnet", "scenario", "validate", file.to_str().unwrap()],
+    );
+    assert_eq!(v["ok"], true, "envelope: {v}");
+    assert_eq!(v["data"]["name"], "funded-trader");
+    let steps = v["data"]["steps"].as_array().expect("steps");
+    assert!(steps
+        .iter()
+        .any(|s| s.as_str().unwrap_or_default().starts_with("fund trader")));
+    assert!(steps
+        .iter()
+        .any(|s| s.as_str().unwrap_or_default() == "pause the clock"));
+}
+
+#[test]
+fn surfnet_scenario_validate_rejects_bad_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("bad.toml");
+    std::fs::write(&file, "name = \"x\"\n[[fund]]\nsol = 1\n").unwrap();
+
+    let v = run_json(
+        tmp.path(),
+        &["surfnet", "scenario", "validate", file.to_str().unwrap()],
+    );
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    assert_eq!(v["error"]["code"], "SCENARIO_INVALID", "envelope: {v}");
+}
+
+#[test]
+fn checked_in_example_scenario_is_valid() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scenarios/funded-trader.toml");
+
+    let v = run_json(
+        tmp.path(),
+        &["surfnet", "scenario", "validate", file.to_str().unwrap()],
+    );
+    assert_eq!(v["ok"], true, "envelope: {v}");
+}
+
+#[test]
+fn surfnet_flag_conflicts_with_rpc_url() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(bin());
+    stripped_env(&mut cmd, tmp.path());
+    let out = cmd
+        .args(["--surfnet", "--rpc-url", "http://127.0.0.1:1", "version"])
+        .output()
+        .expect("spawn");
+    assert!(
+        !out.status.success(),
+        "clap must reject --surfnet with --rpc-url"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("cannot be used with"), "stderr: {stderr}");
+}
+
+#[test]
+fn surfnet_flag_routes_rpc_to_recorded_fork() {
+    let tmp = tempfile::tempdir().unwrap();
+    create_default_local_wallet(tmp.path());
+    write_dead_surfnet_state(tmp.path());
+
+    // With --surfnet the balance read goes to the recorded (dead) Surfnet URL,
+    // so the failure must be an RPC error against 127.0.0.1:1, not mainnet.
+    let v = run_json(tmp.path(), &["--surfnet", "wallet", "balance"]);
+    assert_eq!(v["ok"], false, "envelope: {v}");
+    let msg = v["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("127.0.0.1:1"),
+        "should target the dead Surfnet: {v}"
     );
 }
