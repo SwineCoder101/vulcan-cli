@@ -56,7 +56,6 @@ impl TableRenderable for WalletInfo {
 #[derive(Debug, Serialize)]
 pub struct WalletList {
     pub wallets: Vec<WalletInfo>,
-    /// Linked paymaster wallet name, if any (`vulcan wallet set-fee-payer`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fee_payer: Option<String>,
 }
@@ -736,8 +735,7 @@ fn env_or_default(value: Option<String>, default: &str) -> String {
 
 // ── Inner functions for MCP ────────────────────────────────────────────
 
-/// Link a stored wallet as the paymaster (CLI `wallet set-fee-payer`, MCP
-/// `vulcan_wallet_set_fee_payer`). Takes effect on the next transaction.
+/// Link a stored wallet as the paymaster; applies from the next transaction.
 pub fn execute_set_fee_payer_inner(
     ctx: &AppContext,
     name: &str,
@@ -758,7 +756,6 @@ pub fn execute_set_fee_payer_inner(
     })
 }
 
-/// Unlink the paymaster (CLI `wallet clear-fee-payer`, MCP `vulcan_wallet_clear_fee_payer`).
 pub fn execute_clear_fee_payer_inner(ctx: &AppContext) -> Result<FeePayerCleared, VulcanError> {
     let previous = ctx.wallet_store.clear_fee_payer().map_err(|e| {
         VulcanError::new(ErrorCategory::Io, "FEE_PAYER_CLEAR_FAILED", e.to_string())

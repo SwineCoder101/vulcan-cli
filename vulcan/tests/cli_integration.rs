@@ -32,7 +32,6 @@ fn stripped_env(cmd: &mut Command, fake_home: &std::path::Path) {
 
 const TEST_WALLET_PASSWORD: &str = "vulcan-test-password";
 
-/// Create a local encrypted wallet and return its public key.
 fn create_local_wallet(fake_home: &Path, name: &str) -> String {
     let mut create = Command::new(bin());
     stripped_env(&mut create, fake_home);
@@ -290,8 +289,6 @@ fn run_json(fake_home: &Path, args: &[&str]) -> serde_json::Value {
 }
 
 /// Run `account register` with the given extra args and parse the JSON envelope.
-/// The RPC URL points at a closed local port so any network access fails fast
-/// and deterministically with a `network` category error.
 fn register_offline(fake_home: &Path, extra_args: &[&str]) -> serde_json::Value {
     let mut cmd = Command::new(bin());
     stripped_env(&mut cmd, fake_home);
@@ -317,8 +314,6 @@ fn register_with_unknown_fee_payer_fails_before_any_network_access() {
     let v = register_offline(tmp.path(), &["--fee-payer", "no-such-wallet"]);
 
     assert_eq!(v["ok"], false, "envelope: {v}");
-    // The sponsor lookup is offline and must run before the trader-status RPC
-    // call; otherwise the closed port would surface as TRADER_STATUS_FAILED.
     assert_eq!(
         v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
         "envelope: {v}"
@@ -336,8 +331,6 @@ fn register_with_trader_as_fee_payer_is_a_transparent_noop() {
     let tmp = tempfile::tempdir().unwrap();
     create_default_local_wallet(tmp.path());
 
-    // "mcp-test" is the default (trader) wallet. Naming it as sponsor is not an
-    // error: the trader just pays for itself, so the flow proceeds to the RPC.
     let v = register_offline(tmp.path(), &["--fee-payer", "mcp-test"]);
 
     assert_eq!(v["ok"], false, "envelope: {v}");
@@ -351,8 +344,6 @@ fn register_with_valid_fee_payer_passes_validation_and_reaches_rpc() {
     create_default_local_wallet(tmp.path());
     create_local_wallet(tmp.path(), "sponsor");
 
-    // A distinct stored sponsor clears the offline checks, so the first
-    // failure is the (deliberately unreachable) trader-status RPC call.
     let v = register_offline(tmp.path(), &["--dry-run", "--fee-payer", "sponsor"]);
 
     assert_eq!(v["ok"], false, "envelope: {v}");
@@ -431,19 +422,15 @@ fn linked_paymaster_is_used_by_register_and_can_be_cleared() {
     let list = run_json(tmp.path(), &["wallet", "list"]);
     assert_eq!(list["data"]["fee_payer"], "sponsor", "envelope: {list}");
 
-    // No flag: the linked paymaster clears the offline checks, so the first
-    // failure is the (deliberately unreachable) trader-status RPC call.
     let v = register_offline(tmp.path(), &[]);
     assert_eq!(v["error"]["code"], "TRADER_STATUS_FAILED", "envelope: {v}");
 
-    // A global --fee-payer placed before the subcommand overrides the link.
     let v = register_offline_with_global(tmp.path(), &["--fee-payer", "no-such-wallet"]);
     assert_eq!(
         v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
         "envelope: {v}"
     );
 
-    // The short alias `-f` is the same flag.
     let v = register_offline_with_global(tmp.path(), &["-f", "no-such-wallet"]);
     assert_eq!(
         v["error"]["code"], "FEE_PAYER_WALLET_NOT_FOUND",
@@ -471,8 +458,6 @@ fn register_offline_with_global(fake_home: &Path, global_args: &[&str]) -> serde
 }
 
 /// Drive the MCP server over stdio, sending each request only after the
-/// previous one was answered (the server handles calls concurrently, so a
-/// batch would race). Returns the responses keyed by request id.
 fn mcp_session(
     fake_home: &Path,
     extra_env: &[(&str, &str)],
@@ -621,6 +606,5 @@ fn mcp_can_link_and_clear_the_paymaster_mid_session() {
         "linking an unknown wallet must fail: {bad}"
     );
 
-    // The link file itself is what the send path reads live, so it must be gone on disk too.
     assert!(!tmp.path().join(".vulcan/wallets/fee_payer").exists());
 }

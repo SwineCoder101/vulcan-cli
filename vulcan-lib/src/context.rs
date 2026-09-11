@@ -56,11 +56,8 @@ pub struct AppContext {
     /// Global CLI `--wallet` name: use this stored wallet instead of the default when set.
     /// Ignored when `session_wallet` is present (MCP). Not used by `vulcan mcp` (pass `None`).
     pub wallet_override: Option<String>,
-    /// Global `--fee-payer` override: stored wallet name that pays transaction
-    /// fees (and registration rent) instead of the trader wallet for this run.
-    /// When `None`, the paymaster linked with `vulcan wallet set-fee-payer` is
-    /// read live from the wallet store at each transaction, so MCP sessions see
-    /// link changes immediately.
+    /// Global `--fee-payer` override. When `None`, the linked paymaster is read
+    /// from the wallet store at each transaction.
     pub fee_payer: Option<String>,
     /// Lazily-initialized metadata (fetched on first use).
     metadata: OnceCell<PhoenixMetadata>,

@@ -508,8 +508,7 @@ async fn sign_onboarding_transaction_for_api(
     let mut tx = solana_sdk::transaction::Transaction::new_with_payer(&ixs, Some(&fee_payer));
     tx.message.recent_blockhash = recent_blockhash;
 
-    // Each signer fills only its own signature slot, so signing sequentially
-    // accumulates signatures on the same transaction.
+    // Each signer fills only its own slot; sign trader first, then sponsor.
     let mut signed = signer
         .sign_transaction(&mut tx)
         .await
@@ -528,8 +527,7 @@ async fn sign_onboarding_transaction_for_api(
     Ok((transaction, recent_blockhash.to_string(), fee_payer))
 }
 
-/// The SDK's RegisterTrader builder lists the trader as a readonly non-signer.
-/// When someone else pays, the trader must co-sign to authorize the registration.
+/// The SDK builder lists the trader as a non-signer; a sponsored registration needs its signature.
 fn mark_trader_as_signer(ix: &mut Instruction, trader: &Pubkey) {
     for meta in ix.accounts.iter_mut() {
         if meta.pubkey == *trader {
@@ -702,8 +700,6 @@ async fn submit_referral_activation_tx(
             .map_err(|e| VulcanError::api("BUILD_REGISTER_FAILED", e.to_string()))?
             .into();
         if payer != authority {
-            // Sponsored registration: the payer covers fee and rent, but the trader
-            // authority must still sign to authorize its own registration.
             mark_trader_as_signer(&mut register_ix, &authority);
         }
         ixs.push(register_ix);
@@ -755,8 +751,7 @@ async fn register_authority(
     referral_code: Option<String>,
     fee_payer: Option<&str>,
 ) -> Result<RegisterResult, VulcanError> {
-    // Validate the sponsor wallet first: it is an offline check, so a bad
-    // fee payer fails before any RPC call and is visible in dry runs.
+    // Offline check, so a bad fee payer fails before any RPC call.
     let fee_payer_wallet = resolve_fee_payer(ctx, fee_payer, authority)?;
 
     let status = trader_onboarding_status(ctx, &authority).await?;
@@ -856,8 +851,6 @@ mod tests {
         assert_eq!(format_sol_lamports(2_000_000_000), "2.0");
     }
 
-    // ── Sponsored registration (--fee-payer) ─────────────────────────────
-
     fn sponsored_register_ix(payer: Pubkey, trader: Pubkey) -> Instruction {
         let trader_key = TraderKey::new(trader);
         let params = RegisterTraderParams::builder()
@@ -874,7 +867,6 @@ mod tests {
             .into()
     }
 
-    /// Stand-in for OnboardTraderDelegated: only the onboarder is a signer.
     fn onboarder_only_ix(onboarder: Pubkey) -> Instruction {
         Instruction {
             program_id: Pubkey::new_unique(),
@@ -953,7 +945,6 @@ mod tests {
         );
         let message_before = tx.message_data();
 
-        // Same order as sign_onboarding_transaction_for_api: trader first, then sponsor.
         let first = memory_signer(&trader_kp)
             .sign_transaction(&mut tx)
             .await
@@ -988,7 +979,6 @@ mod tests {
         validate_partial_onboarding_signatures(&tx, &onboarder)
             .expect("only the onboarder slot may be missing");
 
-        // The serialized payload handed to the API carries both local signatures.
         let (serialized, _) = second.into_signed_transaction();
         assert!(!serialized.is_empty());
     }

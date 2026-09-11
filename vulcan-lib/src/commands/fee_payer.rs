@@ -1,9 +1,5 @@
-//! Paymaster support: a stored wallet that pays transaction fees (and
-//! registration rent) instead of the trader wallet.
-//!
-//! On Solana the fee payer is simply the first signer of a transaction, so a
-//! paymaster is a second local signer. It gains no authority over the trader's
-//! funds or positions; Phoenix still requires the trader wallet to sign.
+//! Paymaster: a stored wallet that pays transaction fees and registration rent
+//! instead of the trader wallet. It co-signs as fee payer; the trader still signs.
 
 use crate::commands::trade::prompt_password;
 use crate::context::AppContext;
@@ -14,18 +10,14 @@ use solana_rpc_client::rpc_client::RpcClient;
 use solana_sdk::message::Message;
 use std::str::FromStr;
 
-/// A stored sponsor wallet validated for use as fee payer, before any network access.
-///
-/// Loading is offline (wallet-store lookup and pubkey checks) so a bad name fails
-/// fast and dry runs can report the sponsor. The signer is only unlocked when a
-/// transaction is actually submitted. A sponsor that is the trader wallet itself
-/// resolves to `None`: the trader simply pays its own fees.
+/// Sponsor wallet validated offline; unlocked only when a transaction is signed.
 pub struct FeePayerWallet {
     wallet_file: WalletFile,
     pub pubkey: Pubkey,
 }
 
 impl FeePayerWallet {
+    /// Returns `None` when the sponsor is the trader itself.
     pub fn load(
         ctx: &AppContext,
         name: &str,
@@ -47,7 +39,6 @@ impl FeePayerWallet {
         let pubkey = Pubkey::from_str(&wallet_file.public_key)
             .map_err(|e| VulcanError::validation("INVALID_PUBKEY", e.to_string()))?;
         if pubkey == trader_authority {
-            // The trader is paying for itself; no second signer needed.
             return Ok(None);
         }
         Ok(Some(Self {
@@ -56,7 +47,6 @@ impl FeePayerWallet {
         }))
     }
 
-    /// Unlock the sponsor wallet for signing (prompts for a password if needed).
     pub async fn signer(&self) -> Result<ResolvedSigner, VulcanError> {
         let password = if self.wallet_file.is_local_encrypted() {
             Some(prompt_password()?)
@@ -78,30 +68,18 @@ impl FeePayerWallet {
     }
 }
 
-/// Resolve the fee payer for a transaction signed by `trader_authority`.
-///
-/// Precedence, highest first:
-/// 1. explicit per-call name
-/// 2. global `--fee-payer` (`ctx.fee_payer`)
-/// 3. paymaster linked in the wallet store (`vulcan wallet set-fee-payer`),
-///    read live so MCP link changes apply at once
-/// 4. none: the trader pays its own fees
-///
-/// A sponsor equal to the trader also yields `None`, so one linked paymaster
-/// can serve several trader wallets and be selected as a trader itself.
+/// Precedence: explicit name, then `--fee-payer`, then the linked paymaster.
 pub fn resolve_fee_payer(
     ctx: &AppContext,
     explicit: Option<&str>,
     trader_authority: Pubkey,
 ) -> Result<Option<FeePayerWallet>, VulcanError> {
-    let name = resolve_fee_payer_name(&ctx.wallet_store, ctx.fee_payer.as_deref(), explicit)?;
-    match name {
-        Some(n) => FeePayerWallet::load(ctx, &n, trader_authority),
+    match resolve_fee_payer_name(&ctx.wallet_store, ctx.fee_payer.as_deref(), explicit)? {
+        Some(name) => FeePayerWallet::load(ctx, &name, trader_authority),
         None => Ok(None),
     }
 }
 
-/// Pick which wallet name (if any) should pay, without loading it.
 pub fn resolve_fee_payer_name(
     store: &WalletStore,
     flag_override: Option<&str>,
@@ -112,11 +90,8 @@ pub fn resolve_fee_payer_name(
             .filter(|n| !n.is_empty())
             .map(str::to_string)
     };
-    if let Some(n) = clean(explicit) {
-        return Ok(Some(n));
-    }
-    if let Some(n) = clean(flag_override) {
-        return Ok(Some(n));
+    if let Some(name) = clean(explicit).or_else(|| clean(flag_override)) {
+        return Ok(Some(name));
     }
     store
         .fee_payer()
@@ -125,7 +100,6 @@ pub fn resolve_fee_payer_name(
 
 pub(crate) const LAMPORTS_PER_SOL: u64 = 1_000_000_000;
 
-/// Render lamports as a SOL string without trailing zero padding.
 pub(crate) fn format_sol_lamports(lamports: u64) -> String {
     let whole = lamports / LAMPORTS_PER_SOL;
     let fractional = lamports % LAMPORTS_PER_SOL;
@@ -139,7 +113,6 @@ pub(crate) fn format_sol_lamports(lamports: u64) -> String {
     value
 }
 
-/// Fail with a clear error when the paymaster cannot cover a transaction fee.
 pub(crate) fn check_fee_balance(
     payer: Pubkey,
     balance_lamports: u64,
@@ -158,7 +131,6 @@ pub(crate) fn check_fee_balance(
     Ok(())
 }
 
-/// Look up the paymaster's SOL balance and the fee for `message`, then check it.
 pub(crate) fn ensure_sol_for_fee(
     rpc: &RpcClient,
     payer: Pubkey,
@@ -239,8 +211,6 @@ mod tests {
 
     #[test]
     fn resolver_reads_the_link_live_between_calls() {
-        // MCP keeps one context for the whole session; a link set mid-session
-        // must be honored by the next transaction without a restart.
         let (_dir, store) = store_with(&["sponsor"]);
         assert_eq!(resolve_fee_payer_name(&store, None, None).unwrap(), None);
         store.set_fee_payer("sponsor").unwrap();
@@ -258,7 +228,6 @@ mod tests {
         let dir = ManuallyDrop::new(dir);
         assert!(store.set_fee_payer("nope").is_err());
         store.set_fee_payer("sponsor").unwrap();
-        // Simulate the sponsor wallet being removed after linking.
         std::fs::remove_file(store.wallet_path("sponsor")).unwrap();
         let _keep = &dir;
         assert_eq!(

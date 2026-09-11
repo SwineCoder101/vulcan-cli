@@ -42,8 +42,7 @@ pub enum WalletCommand {
         name: String,
     },
 
-    /// Link a stored wallet as the paymaster: it pays transaction fees and
-    /// registration rent for every command, while the trader wallet still signs.
+    /// Link a stored wallet as the paymaster that pays fees and rent for every command
     SetFeePayer {
         /// Wallet name
         name: String,
